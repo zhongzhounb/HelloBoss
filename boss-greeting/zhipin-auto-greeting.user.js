@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         BOSS直聘自动沟通助手
+// @name         HelloBoss · BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
 // @version      0.1.9
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
@@ -52,6 +52,8 @@
     sheetJsUrl: 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js',
     defaultGreetingText: '您好，我对这个岗位比较感兴趣，希望可以进一步沟通，谢谢。',
     storageQuotaWarnRatio: 0.9,
+    // 卡片还没被列表接口匹配上时，最多推迟几轮再放弃等待（见 processNextCard 的详情闸门）。
+    jobDetailDeferLimit: 3,
   };
 
   // unsafeWindow 是篡改猴注入到页面真实环境的 window；优先用它才能拦截页面自己的 fetch/XHR/history。
@@ -143,6 +145,9 @@
     jobDetailByKey: new Map(),
     latestJobDetail: null,
     cardJobMap: new WeakMap(),
+    // 「本轮先跳过、下轮再来」的计数（扫描 key -> 次数）。给接口数据一点追上的时间，
+    // 生命周期与岗位池一致：换搜索条件/刷新第一页时随池一起清空。
+    jobDetailDeferCount: new Map(),
     seenApiBatches: new Set(),
     jobListContextKey: '',
     jobListLastBatchKey: '',
@@ -1382,6 +1387,7 @@
       runtime.jobDetailByKey = new Map();
       runtime.latestJobDetail = null;
       runtime.cardJobMap = new WeakMap();
+      runtime.jobDetailDeferCount = new Map();
       runtime.seenApiBatches.clear();
       runtime.jobListContextKey = contextKey || '';
       runtime.jobListLastBatchKey = '';
@@ -2563,7 +2569,7 @@
         <aside class="za-panel" aria-label="BOSS自动沟通控制台">
           <header class="za-header">
             <div class="za-header-title">
-              <strong>BOSS自动沟通</strong>
+              <strong>HelloBoss · BOSS自动沟通</strong>
               <span class="za-subtitle">岗位问候自动化</span>
             </div>
             <div class="za-header-actions">
@@ -4476,7 +4482,8 @@
           continue;
         }
 
-        const { card, job, domInfo, key } = nextEntry;
+        // job 用 let：等接口补齐超限的闸门会把它换成带 dataPending 标记的副本。
+        let { card, job, domInfo, key } = nextEntry;
         const cursorIndex = Math.max(Number(currentState.cursorIndex || 0), processedKeys.size);
         logDebugEvent('process_card', {
           cursorIndex,
@@ -4512,6 +4519,31 @@
           RunState.patch(buildProcessedJobPatch(currentState, job, domInfo, captureJobListPosition(job)));
           scrollAheadByJobKey(key);
           return 'processed';
+        }
+
+        // 卡片还没被列表接口匹配上时，详情接口拼不出 URL（缺 securityId/lid），
+        // 薪资/规模/行业会全空。拿这种半成品去判定，等于把「没拿到数据」记成
+        // 「AI 判掉了」——大屏上分不出这两者。所以先原地等接口补齐：这里**不写
+        // processedKeys**，下轮重扫时它仍是 nextEntry，外层循环的随机等待就是退避。
+        // 等够 jobDetailDeferLimit 轮依然没有，才继续走正常流程，把 dataPending 标进记录。
+        if (!canFetchJobDetail(job)) {
+          const deferCount = bumpJobDetailDeferCount(key);
+          logDebugEvent('card_detail_pending', {
+            cursorIndex,
+            scanKey: key,
+            deferCount,
+            limit: APP.jobDetailDeferLimit,
+            requestIdentity: getJobDetailRequestIdentity(job),
+            job: summarizeJobForDebug(job),
+            domInfo: summarizeDomInfoForDebug(domInfo),
+          }, 'warn');
+
+          if (deferCount <= APP.jobDetailDeferLimit) {
+            UI.setStatus(`岗位数据未就绪，等接口补齐（${deferCount}/${APP.jobDetailDeferLimit}）：${job.jobName || ''} / ${job.company || ''}`, 'warn');
+            return 'processed';
+          }
+
+          job = Object.assign({}, job, { dataPending: true });
         }
 
         return this.communicateWithCard(card, job, cursorIndex, domInfo);
@@ -4564,6 +4596,9 @@
     async communicateWithCard(card, job, cursorIndex, initialDomInfo) {
       const cardDomInfo = initialDomInfo || extractCardInfo(card);
       const scanKey = getJobScanKey(job, cardDomInfo);
+      // 该岗位是否在等接口时超过了推迟上限（processNextCard 打的标记）。在入口捕获成
+      // 局部变量：后面 job 会被 mergeJobInfo 反复替换，不指望这个标记一路存活。
+      const dataPending = Boolean(job && job.dataPending);
       // aiGate 模式下在列表页生成好招呼语,随 RunState 跨路由带到聊天页发送。
       let pendingAiGreeting = '';
       // 招呼语版本同样要跨页带到聊天页,否则大屏里 sent 那一行的版本是空的。
@@ -4688,13 +4723,24 @@
       // AI 闸门:此处 job 已含完整 JD、公司规模与城市,信息最全。
       // 判定放在点击沟通之前,减少无意义的聊天页跳转。
       if (config.greetingMode === 'aiGate') {
+        // 数据不全时判定结果不可信：规则里「缺哪一项就当不满足」会把「没拿到数据」
+        // 记成「AI 判掉了」。判定照常走，但理由与记录都要把这个前提标出来，
+        // 否则大屏上这两种完全不同的情况长得一模一样。
+        const dataNote = dataPending ? '［数据不全：未匹配到接口/详情］' : '';
+        if (dataPending) {
+          logDebugEvent('ai_gate_on_incomplete_job', {
+            cursorIndex,
+            job: summarizeJobForDebug(job),
+          }, 'warn');
+        }
+
         const verdict = await AiGate.evaluate(job, scanKey);
         if (!verdict.apply) {
           // 把 verdict.reason 拼进来,而不是写死一句「AI 判定不投」。
           // UI.setStatus 是同步写 textContent、后写覆盖先写,所以覆盖在 AiGate 内部
           // 设的提示上的是这一条 —— 只有把真实原因带上,服务不可用才不会被显示成
           // 「岗位不合适」,那正好是 fail-closed 要避免的混淆。
-          UI.setStatus(`AI 闸门跳过：${job.jobName || ''} / ${job.company || ''} —— ${verdict.reason || '未给出原因'}`, 'warn');
+          UI.setStatus(`AI 闸门跳过：${job.jobName || ''} / ${job.company || ''} —— ${dataNote}${verdict.reason || '未给出原因'}`, 'warn');
           logDebugEvent('skip_ai_gate', {
             cursorIndex,
             reason: verdict.reason,
@@ -4706,8 +4752,9 @@
             listIndex: cursorIndex,
             skippedAt: nowIso(),
             skipReason: 'ai_gate',
-            aiGateReason: verdict.reason,
+            aiGateReason: `${dataNote}${verdict.reason || ''}`,
             aiGateVariant: verdict.meta && verdict.meta.variant,
+            dataIncomplete: dataPending,
             pageUrl: location.href,
           });
           // verdict 区分「判不了」与「判不投」:服务不可用时 meta.fallback 为真,
@@ -4715,7 +4762,7 @@
           Ledger.report(job, {
             stage: 'skipped',
             verdict: (verdict.meta && verdict.meta.fallback) ? null : false,
-            reason: verdict.reason || 'AI 判定不投',
+            reason: `${dataNote}${verdict.reason || 'AI 判定不投'}`,
             variant: (verdict.meta && verdict.meta.variant) || '',
           });
           skipCurrentJobAndAdvance(job, cardDomInfo, scanKey);
@@ -4739,6 +4786,7 @@
         status: 'clicked',
         listIndex: cursorIndex,
         clickedAt: nowIso(),
+        dataIncomplete: dataPending,
         pageUrl: location.href,
       });
 
@@ -6133,6 +6181,21 @@
     });
 
     return identity;
+  }
+
+  // 详情接口能不能拼出来：securityId 与 lid 缺任一个，buildJobDetailApiUrl 都会返回空串。
+  // 拉不到详情 = 薪资/规模/行业全空，这种半成品不该拿去判定。
+  function canFetchJobDetail(job) {
+    const identity = getJobDetailRequestIdentity(job);
+    return Boolean(identity.securityId && identity.lid);
+  }
+
+  // 未匹配到接口的卡片推迟计数：每推迟一轮加一。给接口数据追上来的时间，
+  // 同时保证不会无限等 —— 超过上限就必须继续走正常流程（见 processNextCard）。
+  function bumpJobDetailDeferCount(key) {
+    const next = (runtime.jobDetailDeferCount.get(key) || 0) + 1;
+    runtime.jobDetailDeferCount.set(key, next);
+    return next;
   }
 
   function buildJobDetailApiUrl(job) {
@@ -8900,14 +8963,31 @@
     return text && !isEncryptedSalary(text) ? text : '';
   }
 
-  // 判断薪资是否可读；私有区字符返回空。
+  // BOSS 把薪资里的数字渲染成 Unicode 私有区字形：0xE031='0'、0xE032='1' … 0xE03A='9'。
+  // 该映射用真实日志对齐验证过（同一岗位的接口明文 vs DOM 密文，18 组全部吻合）。
+  // 只映射这个已知区间，其余字符原样保留 —— 字形表若变更，残留的私有区字符会让下面的
+  // isEncryptedSalary 把整串判为不可读，于是退回空串，而不是把乱码当薪资记下来。
+  // 刻意用码点比较而不是正则字面量：私有区字符在源码里不可见，写进正则极易被编辑器改坏。
+  function decodePrivateUseDigits(value) {
+    const text = String(value == null ? '' : value);
+    let out = '';
+    for (const ch of text) {
+      const code = ch.codePointAt(0);
+      out += (code >= 0xE031 && code <= 0xE03A)
+        ? String(code - 0xE031)
+        : ch;
+    }
+    return out;
+  }
+
+  // 判断薪资是否可读：先尝试解码私有区数字，解不掉（仍有残留私有区字符）才返回空。
   function getReadableSalary(value) {
-    const text = normalizeText(value);
+    const text = normalizeText(decodePrivateUseDigits(value));
     if (!text || isEncryptedSalary(text)) return '';
     return text;
   }
 
-  // BOSS 私有字体薪资一般落在 Unicode 私有区，不能用于记录和匹配。
+  // 解码后仍残留私有区字符（字形表里没有的码位）时判为不可读，调用方据此退回空串。
   function isEncryptedSalary(text) {
     // BOSS 部分 DOM 会用私有区字体映射展示薪资，如 “-K”；接口 salaryDesc 通常是明文。
     return /[\uE000-\uF8FF]/.test(String(text || ''));
