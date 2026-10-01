@@ -1,0 +1,11 @@
+{
+  "name": "boss-ai-gate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "BOSS 直聘岗位投递判定与招呼语生成服务",
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/server.js"
+  }
+}

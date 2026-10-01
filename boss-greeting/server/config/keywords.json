@@ -1,0 +1,49 @@
+{
+  "priority": ["cpp", "cpp_rag", "java", "iot", "pdd"],
+  "variants": {
+    "cpp": {
+      "label": "C++ 通用 / 后端",
+      "keywords": {
+        "C++": 3, "Qt": 2, "STL": 2, "设计模式": 2, "面向对象": 2,
+        "Socket": 2, "TCP/IP": 2, "epoll": 2, "select": 1,
+        "多线程": 2, "Linux": 2, "MySQL": 2, "Redis": 2, "网络编程": 2
+      }
+    },
+    "cpp_rag": {
+      "label": "C++ / AI 智能体",
+      "keywords": {
+        "C++": 3, "STL": 2, "设计模式": 2, "Socket": 2, "TCP/IP": 2, "epoll": 2,
+        "多线程": 2, "Linux": 2, "MySQL": 2, "Redis": 2, "网络编程": 2,
+        "RAG": 5, "检索增强": 5, "LangGraph": 5, "Function Calling": 5,
+        "智能体": 4, "Agent": 4, "大模型": 4, "向量": 3, "embedding": 3, "LLM": 3
+      }
+    },
+    "java": {
+      "label": "Java 后端",
+      "keywords": {
+        "Java": 5, "Spring": 4, "SpringBoot": 4, "Spring Cloud": 4, "SpringCloud": 4,
+        "MyBatis": 3, "JVM": 3, "JUC": 3, "IOC": 2, "AOP": 2,
+        "微服务": 4, "分布式": 3, "后端": 3, "MySQL": 2, "Redis": 2, "Kafka": 3
+      }
+    },
+    "iot": {
+      "label": "IoT / 嵌入式 / 上位机",
+      "keywords": {
+        "嵌入式": 5, "物联网": 5, "IoT": 5, "MQTT": 5, "ESP8266": 4,
+        "串口": 5, "CRC16": 4, "Modbus": 4, "UART": 4, "RS232": 4, "RS485": 4,
+        "单片机": 4, "上位机": 5, "PLC": 4, "下位机": 4, "帧协议": 4,
+        "Qt": 2, "C++": 2, "Linux": 1
+      }
+    },
+    "pdd": {
+      "label": "C++ / Qt 客户端 / 跨平台",
+      "keywords": {
+        "Qt": 5, "客户端": 4, "GUI": 4, "自绘": 4, "桌面": 3,
+        "C++": 3, "STL": 2, "设计模式": 2, "跨平台": 4,
+        "Flutter": 3, "React Native": 3, "多线程": 3, "线程池": 3,
+        "CompletableFuture": 3, "Socket": 2, "TCP/IP": 2, "epoll": 2,
+        "RAG": 3, "Function Calling": 3, "多模态": 3, "编译原理": 2
+      }
+    }
+  }
+}
