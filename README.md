@@ -1,82 +1,135 @@
-# boss-auto-greeting
+# HelloBoss
 
-两个互相独立的求职自动化工具，都是零依赖的单文件油猴（Tampermonkey）脚本。
+在 BOSS 直聘按**你自己写的规则**筛选岗位并自动向 HR 打招呼，判定过程实时显示在一块本机大屏上。
 
-| 目录 | 干什么 | 需要什么 |
-|---|---|---|
-| [`boss-greeting/`](boss-greeting/) | 在 BOSS 直聘按你自己写的规则筛选岗位、自动打招呼，并把判定过程显示在一块本机大屏上 | 油猴脚本 + 一个本地 Node 服务（自带，零依赖） |
-| [`autofill/`](autofill/) | 在任意招聘官网的网申表单里，按字段自身的语义自动填写你的信息，自动翻页，**永不代提交** | 只要油猴脚本 |
+**零依赖**：一个单文件的油猴（Tampermonkey）脚本，加一个只用 Node 内置模块的本地服务。
 
-两者**各自注入、各存各的数据、各跑各的流程**，装哪个都不影响另一个，也不需要同时装。
+> 仓库目录名仍叫 `boss-auto-greeting`（旧名），对外的项目名统一是 **HelloBoss**。
+> 目录与文件名没跟着改，是为了不让文档链接和启动脚本失效。
 
 ---
 
-## 两句话讲清它们的路线
+## 三个部件
 
-**boss-greeting** —— 投/不投完全由你在大屏上写的一段自然语言规则决定，服务端不内置任何筛选逻辑。
-规则里写「月薪 20K 以上直接投」「创业公司小于 50 人不投」，模型照此裁决。**规则留空 = 一个岗位都不投**
-（这是刻意的安全默认，理由见下）。
-
-**autofill** —— 不看你是哪个网站，只看每个输入框自己的 label / placeholder / 相邻文本，
-推断它要什么，再从你维护的信息表里取值。所以没被任何规则库收录的小众官网也能填。
-
-两个工具都会调用大模型，**都要你自己配一个 API 密钥**（支持 Anthropic 官方密钥，以及任何
-Anthropic Messages 格式的转发端点）。不配也能跑：boss-greeting 会一个岗位都不投，autofill 退化成纯本地词典。
+| 文件 | 作用 |
+|---|---|
+| [`boss-greeting/zhipin-auto-greeting.user.js`](boss-greeting/zhipin-auto-greeting.user.js) | 油猴主脚本。翻岗位列表、读岗位信息、调本地服务拿判定、发招呼语、记流水 |
+| [`boss-greeting/zhipin-devtools-unlock.user.js`](boss-greeting/zhipin-devtools-unlock.user.js) | 调试辅助。BOSS 页面有反调试逻辑，它让 DevTools 保持可用。**平时可以不装** |
+| [`boss-greeting/server/`](boss-greeting/server/) | 本地服务（Node 22+，零依赖）。判定岗位、生成招呼语、托管大屏、存记录 |
 
 ---
 
 ## 快速开始
 
-### 1. autofill（最简单，不需要服务）
+### 1. 装油猴脚本
 
-1. 浏览器装好 Tampermonkey / 油猴。
-2. 把 [`autofill/autofill.user.js`](autofill/autofill.user.js) 拖进浏览器安装。
-3. 打开任意页面，右下角面板里填「信息表」并保存。
-4. 遇到网申表单，点「开始填写」。
+浏览器装好 Tampermonkey / 油猴，把 `boss-greeting/zhipin-auto-greeting.user.js` 拖进去安装。
 
-详见 [autofill/README.md](autofill/README.md)。
+### 2. 起本地服务并打开大屏
 
-### 2. boss-greeting
+```bash
+cd boss-greeting/server
+npm start          # 需要 Node 22+；零依赖，不用 npm install
+```
 
-1. 装油猴脚本 [`boss-greeting/zhipin-auto-greeting.user.js`](boss-greeting/zhipin-auto-greeting.user.js)。
-2. 起本地服务并打开大屏：
+然后浏览器打开 <http://127.0.0.1:8787/dashboard>。
 
-   ```bash
-   cd boss-greeting/server
-   npm start          # 需要 Node 22+；零依赖，不用 npm install
-   ```
+Windows 上也可以直接双击 `boss-greeting/server/打开大屏.vbs` —— 它会先把服务隐藏着拉起来，
+再在 Edge 里开好大屏和 BOSS 直聘两个标签页，全程不用碰命令行。
 
-   然后浏览器打开 <http://127.0.0.1:8787/dashboard>。
-   Windows 上也可以直接双击 `boss-greeting/server/打开大屏.vbs`（它会先把服务隐藏着拉起来）。
+> **服务跟着大屏页面走**：关掉大屏那个标签页 60 秒后，服务自己退出，不留后台进程。
+> 最小化、切到 BOSS 那页都不影响。建议把大屏标签页「固定」住（右键 → 固定），
+> 免得后台放久了被浏览器的睡眠标签页功能丢弃。
+>
+> 代价要清楚：大屏一关，油猴脚本就找不到判定服务了。判定是 fail-closed，
+> 所以后果是**静默地一个岗位都不投**，而不是投错。
 
-3. 在大屏上做三件事：**填 AI 接入的密钥** → **写投递规则** → （可选）**放一份简历**。
-   三件事任一没做，大屏顶部会有红色提示条告诉你后果。
+### 3. 在大屏上做三件事
 
-详见 [boss-greeting/README.md](boss-greeting/README.md)。
+大屏顶部有一条红色提示条，只要下面任何一项没做，它就会告诉你后果：
+
+| 配置 | 在哪配 | 不配的后果 |
+|---|---|---|
+| **AI 密钥** | 大屏「AI 接入」面板 | 判定全部跳过 —— 一个岗位都不投 |
+| **投递规则** | 大屏「打招呼判定」面板 | 同上 |
+| **简历** | 把简历（`.txt`）放进 `boss-greeting/server/resumes/`（**别叫 `example.txt`**，它会被跳过） | 同上 |
+
+**大屏是唯一的配置入口** —— 没有配置文件要手改。改完保存立即生效，不用重启服务。
 
 ---
 
-## 为什么「规则留空就一个都不投」
+## 投递规则就是一段自然语言
+
+没有开关、没有阈值表单、没有配置文件 —— **规则整段就是你在大屏上写的那段话**：
+
+```
+月薪 20K 以上直接投；
+否则公司规模 1000 人以上才投，创业小公司不投；
+只投青岛、杭州、上海。
+```
+
+服务端不内置任何一条筛选逻辑，只负责把你的规则、简历摘要和岗位信息拼起来交给模型，
+再把模型回的 `{"apply":true/false}` 解析成结论。想适配另一个人，换掉那段话就行。
+
+不确定怎么写，点「打招呼判定」面板里的 **`填入示例`** —— 它会填进一份多条件规则的样例，
+照着改就行。（示例是编的，每个数字都得按你的情况改。）
+
+---
+
+## 为什么「没配就一个都不投」
 
 自动发出去的招呼语**收不回来**，而漏投的岗位下次还能再投一遍。所以这一条是刻意做成
 fail-closed 的：没配规则、没配密钥、没放简历，任何一项缺失都表现为「不投」，而不是
 拿一套内置默认规则顶上。
 
-理由很实际：这个仓库一旦开源，别人是照着仓库里的默认状态跑的。一个「没配就直接开投」的
+理由很实际：这个仓库开源出去，别人是照着仓库里的默认状态跑的。一个「没配就直接开投」的
 默认值，会让使用者在不知情的情况下按**别人的标准**投递。
+
+同理，`resumes/example.txt` 是给人看格式的**模板**，服务按文件基名识别并跳过它 ——
+否则 clone 下来没配任何东西的人，会拿示例里的「张三 / 示例大学」通过闸门把招呼语发出去。
+
+---
+
+## 项目结构
+
+```
+HelloBoss/
+├── boss-greeting/
+│   ├── zhipin-auto-greeting.user.js    油猴主脚本
+│   ├── zhipin-devtools-unlock.user.js  调试辅助（平时可不装）
+│   ├── docs/                           设计文档
+│   └── server/                         本地判定服务与大屏（Node，零依赖）
+│       ├── src/                        服务源码
+│       ├── config/                     关键词表；server.json 运行期生成
+│       ├── resumes/                    简历目录，带一份示例
+│       ├── launcher/                   打包 exe 用的引导层
+│       └── test/                       测试
+└── README.md / AGENTS.md / LICENSE
+```
+
+服务侧的运行期数据（`server/data/`）与局域网令牌（`server/config/server.json`）都在
+gitignore 里；简历目录除 `example.txt` 外一律不进版本管理 —— 简历是个人信息。
+
+---
+
+## 打包成 exe（给没装 Node 的人）
+
+`boss-greeting/server/打包exe.cmd` 产出 `dist/`，整个文件夹压成 zip 发出去：对方**不用装 Node**，
+解压后双击 `HelloBoss.exe`，服务在后台起来、自动开两个 Edge 标签页。
+
+细节见 [boss-greeting/server/README.md](boss-greeting/server/README.md)。
 
 ---
 
 ## 测试
 
-两边都是零依赖、离线可跑的：
+零依赖、离线可跑，用 Node 自带的 `node --test`：
 
 ```bash
-cd autofill && npm test            # 114 个用例
-cd boss-greeting/server && npm test # 171 个用例
+cd boss-greeting/server && npm test
 ```
 
-不装 npm 包，用的是 Node 自带的 `node --test`。
+不装 npm 包，不需要联网。
 
 ---
 
@@ -91,7 +144,7 @@ cd boss-greeting/server && npm test # 171 个用例
    - 用于绕过网站/平台的访问限制、风控机制并从事损害第三方合法权益的活动。
 3. **责任声明** 使用者在使用本项目过程中，因违反上述约定或相关法律法规所产生的一切法律责任，均由使用者自行承担，与本项目作者无关。作者不对因使用（或无法使用）本项目所造成的任何直接或间接损失负责。
 4. **无担保声明** 本项目按"现状"提供，不附带任何明示或暗示的担保，包括但不限于适销性、特定用途适用性及不侵权的保证。作者不保证代码的完整性、稳定性或长期可用性。
-5. **知识产权与二次分发** 本项目遵循 MIT 协议开源。若进行二次开发或分发，请遵守相应许可证条款，并保留原作者署名及本声明。
+5. **知识产权与二次分发** 本项目遵循 MIT 协议开源（见 [LICENSE](LICENSE)）。若进行二次开发或分发，请遵守相应许可证条款，并保留原作者署名及本声明。
 6. **最终解释权** 若发现有违反上述声明的行为，作者保留追究相关法律责任的权利，并可能停止对相关使用者提供任何形式的支持。
 
 ------
