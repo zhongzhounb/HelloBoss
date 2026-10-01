@@ -161,13 +161,14 @@ test('CSV 对空记录也不产生多余列', () => {
 // 东八区。固定它而不是读本机时区,断言才是纯算术的、跨机器成立。
 const CST = { offsetMinutes: 480 };
 
-test('dailyCounts 把同一天的记录合并并区分 sent/skipped', () => {
+test('dailyCounts 把同一天的记录合并,并区分已投递 / 已判定', () => {
   const ledger = createLedger(tempFile('jobs.jsonl'));
-  ledger.append({ ...base, at: '2026-09-24T02:00:00.000Z', stage: 'sent' });
-  ledger.append({ ...base, at: '2026-09-24T06:00:00.000Z', stage: 'skipped' });
-  ledger.append({ ...base, at: '2026-09-24T14:00:00.000Z', stage: 'skipped' });
+  ledger.append({ ...base, at: '2026-09-24T02:00:00.000Z', stage: 'sent', verdict: true });
+  ledger.append({ ...base, at: '2026-09-24T06:00:00.000Z', stage: 'skipped', verdict: false });
+  // verdict 为 null = 没走到判定(黑名单 / 已沟通等前置跳过),不计入「已判定」。
+  ledger.append({ ...base, at: '2026-09-24T14:00:00.000Z', stage: 'skipped', verdict: null });
 
-  assert.deepEqual(ledger.dailyCounts(CST), [{ date: '2026-09-24', sent: 1, skipped: 2 }]);
+  assert.deepEqual(ledger.dailyCounts(CST), [{ date: '2026-09-24', sent: 1, judged: 2 }]);
 });
 
 test('dailyCounts 跨天分离并按日期升序', () => {
@@ -190,8 +191,8 @@ test('dailyCounts 按本地日期分组,凌晨的记录不会算到前一天', (
   ledger.append({ ...base, at: '2026-09-24T15:59:00.000Z', stage: 'skipped' }); // 北京 23:59,仍在 24 号
 
   assert.deepEqual(ledger.dailyCounts(CST), [
-    { date: '2026-09-24', sent: 0, skipped: 1 },
-    { date: '2026-09-25', sent: 1, skipped: 0 },
+    { date: '2026-09-24', sent: 0, judged: 1 },
+    { date: '2026-09-25', sent: 1, judged: 1 },
   ]);
 });
 
@@ -203,7 +204,7 @@ test('dailyCounts 跳过 at 缺失或损坏的记录,不编造日期', () => {
   ledger.append({ ...base, at: '不是时间', stage: 'sent' });
   ledger.append({ ...base, at: '2026-09-24T02:00:00.000Z', stage: 'sent' });
 
-  assert.deepEqual(ledger.dailyCounts(CST), [{ date: '2026-09-24', sent: 1, skipped: 0 }]);
+  assert.deepEqual(ledger.dailyCounts(CST), [{ date: '2026-09-24', sent: 1, judged: 1 }]);
 });
 
 test('dailyCounts 无记录时返回空数组', () => {

@@ -1,5 +1,5 @@
 # 除了示例以外,放进本目录的简历都是个人信息,不随仓库走。
 # 想把自己的一份纳入版本管理,就显式 git add -f 它,或者改这里的规则。
 *
-!example.typ
+!example.txt
 !.gitignore

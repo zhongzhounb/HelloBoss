@@ -12,15 +12,17 @@ import {
   pickSample,
   buildGreetingSystemPrompt,
   buildTemplateGreeting,
+  buildProbePrompt,
 } from '../src/evaluator.js';
-import { parseResumeFile } from '../src/resumeParser.js';
+import { parseResumeByExtension } from '../src/resumeParser.js';
 
-// 用仓库自带的示例简历,而不是本机某份真实简历 —— 这条测试要在任何人的 clone 上都跑得通。
+// 用仓库自带的示例简历(推荐格式是 .txt),而不是本机某份真实简历 ——
+// 这条测试要在任何人的 clone 上都跑得通。
 // 注意它是**在 import 阶段**读的:路径不对会让整个测试文件加载失败,而不是某一条用例失败。
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PROFILE = parseResumeFile(
-  fs.readFileSync(path.resolve(HERE, '..', 'resumes', 'example.typ'), 'utf8'),
-  'example',
+const PROFILE = parseResumeByExtension(
+  'example.txt',
+  fs.readFileSync(path.resolve(HERE, '..', 'resumes', 'example.txt'), 'utf8'),
 );
 
 test('extractJson 解析裸 JSON', () => {
@@ -183,17 +185,12 @@ test('pickSample 对空数组与非法输入返回空串', () => {
   assert.equal(pickSample('不是数组'), '');
 });
 
-test('没填样例时不加风格要求', () => {
-  const prompt = buildGreetingSystemPrompt('');
-  assert.doesNotMatch(prompt, /模仿/);
-  // 载重内容仍在:少了这句,模型会放飞成客套模板腔。
+test('招呼语 system prompt 限定长度,并禁止编造经历', () => {
+  const prompt = buildGreetingSystemPrompt();
+  // 载重内容仍在:少了长度那句,模型会放飞成客套模板腔;
+  // 少了「不要编造」那句,它会拿简历里根本没有的经历凑句子。
   assert.match(prompt, /60 字以内/);
-});
-
-test('填了样例时把样例作为风格要求带上,并禁止照抄', () => {
-  const prompt = buildGreetingSystemPrompt('中秋节快乐');
-  assert.match(prompt, /中秋节快乐/);
-  assert.match(prompt, /不要照抄/, '必须明说只学风格 —— 否则模型会把与岗位无关的样例原样抄出去');
+  assert.match(prompt, /不要编造简历里没有的经历/);
 });
 
 test('模板兜底招呼语包含姓名、学校与岗位名', () => {
@@ -320,4 +317,12 @@ test('decideByPrompt 显式传空密钥时直接 fallback，绝不回落到旧�
   assert.equal(result.fallback, true);
   assert.equal(result.apply, false, 'fail-closed：拿不到结论一律不放行');
   assert.match(result.error, /API Key/);
+});
+
+test('探测 prompt 同时给出 system 与 user，供「测试连通」使用', () => {
+  const probe = buildProbePrompt();
+  assert.ok(probe.system.trim(), 'system 不能为空 —— callMessagesApi 会原样发出去');
+  assert.ok(probe.user.trim());
+  // 探测只要一个字的回答:内容越短,该花的预算越少,测试越快。
+  assert.ok(probe.user.length < 20, '探测 prompt 不该啰嗦');
 });

@@ -188,8 +188,8 @@ export async function decideByPrompt(job, profile, ruleText, options = {}) {
   return { apply: false, reason: '', fallback: true, error: message };
 }
 
-// 从用户的招呼样例里随机挑一条。空数组返回空串 —— 调用方据此决定「不加风格要求」,
-// 从而让没填样例时退化成普适的招呼语生成。
+// 从用户的招呼样例里随机挑一条。空数组返回空串 —— 调用方据此决定「没配样式,
+// 退回 AI 生成」还是「配了,原样发这条」(见 server.js 的 evaluateJob)。
 export function pickSample(samples, random = Math.random) {
   if (!Array.isArray(samples) || !samples.length) return '';
   const index = Math.floor(random() * samples.length);
@@ -197,20 +197,13 @@ export function pickSample(samples, random = Math.random) {
   return samples[Math.min(Math.max(index, 0), samples.length - 1)] || '';
 }
 
-// 招呼语生成的 system prompt。传入样例时会附一条风格要求。
-// 明说「只学语气与结构、内容仍须来自简历」,否则模型容易把「中秋节快乐」这类
-// 跟岗位无关的样例原样抄出去。
-export function buildGreetingSystemPrompt(sample) {
-  const lines = [
+// 招呼语生成的 system prompt。**只在用户没配「打招呼样式」时才会用到** ——
+// 配了样式的话,服务端直接把那条样例原样发出去,不经过模型(见 server.js 的 evaluateJob)。
+export function buildGreetingSystemPrompt() {
+  return [
     '你是求职助手。根据候选人简历与目标岗位,写一句中文打招呼语。',
     '要求:60 字以内;口语自然,不要客套模板腔;点出与岗位最相关的 1-2 项经历;不要编造简历里没有的经历;只输出招呼语本身,不要引号。',
-  ];
-
-  if (sample) {
-    lines.push(`本次模仿这个样例的语气与结构(只学风格,内容仍须来自简历与岗位,不要照抄):${sample}`);
-  }
-
-  return lines.join('\n');
+  ].join('\n');
 }
 
 // LLM 不可用时的兜底招呼语。宁可发出去一条普通的,也不要静默漏投。
@@ -219,4 +212,13 @@ export function buildTemplateGreeting(profile, job) {
   const skill = profile.sections.skills[0]?.label || '';
   const jobName = job.jobName || '该岗位';
   return `您好,我是${profile.name},来自${school},${skill}方向。看到贵司「${jobName}」岗位比较感兴趣,希望进一步沟通,谢谢。`;
+}
+
+// 大屏「测试连通」按钮用的探测请求。它不参与判定,只用来验证端点 / 密钥 / 模型
+// 能不能真的回话,所以要求回的内容越短越好。
+export function buildProbePrompt() {
+  return {
+    system: '你是连通性测试助手。',
+    user: '只回复两个字:ok',
+  };
 }

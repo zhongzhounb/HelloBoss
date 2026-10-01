@@ -118,7 +118,7 @@ export function createLedger(file) {
     return { current, total };
   }
 
-  // 每天的处理量(已沟通 / 未沟通),给大屏柱状图用。
+  // 每天的已投递 / 已判定,给大屏柱状图用。
   //
   // 按**本地日期**分组,不是 UTC。at 是 toISOString() 的 UTC 串,而服务跑在 UTC+8:
   // 北京凌晨 00:00-08:00 的记录若按 UTC 分组会被算到前一天,柱状图整体错位一天 ——
@@ -141,14 +141,17 @@ export function createLedger(file) {
       const date = new Date(time + offsetMinutes * 60000).toISOString().slice(0, 10);
       let bucket = buckets.get(date);
       if (!bucket) {
-        bucket = { date, sent: 0, skipped: 0 };
+        bucket = { date, sent: 0, judged: 0 };
         buckets.set(date, bucket);
       }
 
-      // 未沟通 = 当天所有非 sent 的记录(前置跳过、判定不投、发送异常都算在内),
-      // 与柱状图的「已沟通 + 未沟通 = 当天处理过的岗位总数」口径对应。
+      // 已投递 = 当天真的把招呼语发出去的岗位。
       if (record.stage === 'sent') bucket.sent += 1;
-      else bucket.skipped += 1;
+      // 已判定 = 当天拿到 AI 判定结论的岗位(verdict 严格 true/false)。
+      // 这里刻意**不是**「所有没发出去的岗位」:黑名单 / 已沟通 / 无沟通按钮这类前置跳过,
+      // 以及判定服务不可用,verdict 都是 null —— 它们压根没走到判定,不该记进「已判定」。
+      // 注意已投递的岗位也有判定结论,所以两根柱子是包含关系而不是相加关系。
+      if (record.verdict !== null) bucket.judged += 1;
     }
 
     return [...buckets.values()].sort((a, b) => a.date.localeCompare(b.date));

@@ -50,7 +50,7 @@ test('上半屏含配置面板与柱状图容器', () => {
 
 test('顶部有全宽标题栏与服务状态按钮', () => {
   const html = renderDashboardHtml();
-  assert.ok(html.includes('岗位判定大屏'), '标题栏应写「岗位判定大屏」');
+  assert.ok(html.includes('HelloBoss'), '标题栏应写「HelloBoss」');
   assert.ok(html.includes('id="svcBtn"'));
   // 打开时服务状态还没探测到,按钮就先显示「启动中」—— 不能一上来就说「运行中」,
   // 那是在没验证过的情况下撒谎。
@@ -121,6 +121,32 @@ test('柱状图是纯 CSS 实现的,没有引入图表库', () => {
   assert.doesNotMatch(html, /<canvas/i);
 });
 
+test('柱状图两条线是「已投递 / 已判定」,不再是「已沟通 / 未沟通」', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('<i class="ok"></i>已投递'), '第一根柱子应是「已投递」');
+  assert.ok(html.includes('<i class="no"></i>已判定'), '第二根柱子应是「已判定」');
+  // 「未沟通」把黑名单 / 已沟通这类没走到判定的前置跳过也算进去,和「已判定」不是一回事,
+  // 会让人误以为柱子里全是 AI 判掉的岗位 —— 图里不该再出现这个词。
+  assert.ok(!html.includes('未沟通'), '图例与提示里不该再出现「未沟通」');
+  assert.ok(html.includes(' 已投递 '), 'tooltip 要跟着改成新口径');
+});
+
+test('「筛选倍数」在提示语下方独立一行,样本不足时显示占位符', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="ratio"'), '倍数要有独立的显示位');
+  assert.ok(html.includes('筛选倍数'), '要写清是倍数 —— 它恒 ≥1,叫百分比会误导');
+  // 位置:紧跟在「已判定 = …」那行说明之后。挂在图上会跟着柱状图重绘,放在说明下面更稳。
+  const hintAt = html.indexOf('已判定 = 当天拿到 AI 判定结论');
+  const ratioAt = html.indexOf('id="ratio"');
+  assert.ok(hintAt > 0 && ratioAt > hintAt, '倍数应排在说明文字下方');
+  // 阈值:窗口内已投递不足 20 份就不给数字 —— 样本太小算出来的倍数会被当成结论。
+  assert.ok(html.includes('MIN_SENT_FOR_RATIO = 20'), '阈值默认 20');
+  assert.ok(html.includes('sumSent >= MIN_SENT_FOR_RATIO'), '按阈值分支');
+  assert.ok(html.includes("'筛选倍数 --'"), '样本不足时走占位符分支');
+  assert.ok(html.includes('sumJudged / sumSent'), '先求和再相除,不能按天平均');
+  assert.ok(html.includes('toFixed(2)'), '保留两位小数');
+});
+
 // ---- AI 接入面板 ----
 //
 // 这一组守的是「密钥不进大屏、也不会被误清」。开源后用户要在这里填自己的
@@ -169,5 +195,69 @@ test('没加载到简历时有单独的警告条，依据是 /health 的 profile
   // 判断依据必须接在健康检查的结果上。规则警告条看的是 settings,两者不同源 ——
   // 混用会让「有规则但没简历」这种情况一条提示都不出。
   assert.ok(html.includes('health.profiles === 0'), '警告条的显示条件要接在 /health 的结果上');
+});
+
+test('大屏挂一条长连接给服务端当「有人在看」的信号', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes("new EventSource('/api/watch')"), '要连上 /api/watch 这条流');
+  // 状态灯的依据就是这条连接:连上变绿、断了变红(EventSource 自己会重连)。
+  assert.ok(html.includes("watch.addEventListener('open'"), '连上要反映到状态灯上');
+  assert.ok(html.includes("watch.addEventListener('error'"), '断了也要反映到状态灯上');
+  assert.ok(html.includes('openWatch();'), '首屏就要把这条连接挂上,不能等用户点按钮');
+});
+
+test('状态灯只有一个写入者,不会几处各写各的', () => {
+  const html = renderDashboardHtml();
+  // 以前 poll()(1.5 秒一次)失败也会把灯拨红,于是 /api/records 偶发抖动时
+  // 会出现「服务好好的,灯却是红的」。现在只有那条长连接说了算。
+  assert.doesNotMatch(html, /svcState/, '不该再有第二个状态变量跟着抢着改灯');
+  // 切到 poll() 结束(下一个分区注释)为止,别用固定字符数 —— 切短了这条断言就形同虚设。
+  const pollBody = html.slice(html.indexOf('function poll()'), html.indexOf('// ---- 配置读写 ----'));
+  assert.doesNotMatch(pollBody, /setSvcState/, 'poll() 不该再改状态灯,失败提示交给顶部的横幅');
+});
+
+test('页面上写清了「服务跟着本页,关掉就停」', () => {
+  const html = renderDashboardHtml();
+  // 这是行为的一部分,不能只写在 README 里:用户关掉页面的那一刻,
+  // 判定服务就没了,而判定是 fail-closed —— 后果是一个岗位都不投,却看不出为什么。
+  assert.ok(html.includes('关掉这个标签页'), '要说清关掉本页的后果');
+  assert.ok(html.includes('最小化'), '最小化不影响,这一条同样要说,否则用户会不敢切标签页');
+});
+
+test('AI 面板有「测试连通」按钮,测的是页面上当前填的值', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="btnAiTest"'), '要有测试连通按钮');
+  assert.ok(html.includes("postJson('/api/ai/test'"), '要走探测接口');
+
+  // 密钥框留空 = 用已保存的那把:提交体里别塞空密钥。
+  // 服务端本身也按这个约定兜底,但页面少发一个字段更不容易出错,也和保存时的写法一致。
+  assert.ok(html.includes('if (key) body.aiKey = key'), '空密钥不进测试请求');
+  // 探测要十几秒,没有「测试中…」的话用户会以为没点中而连点。
+  assert.ok(html.includes('测试中…'), '要有进行中的反馈');
+  // 失败要把上游原话摆出来,不能只显示一个「失败」。
+  assert.ok(html.includes("'测试失败:' + data.error"), '失败原因要照搬上游原话');
+});
+
+test('判定规则的「填入示例」是脱敏过的通用模板', () => {
+  const html = renderDashboardHtml();
+  // 脱敏:真实公司名与真实地名一个都不能进示例
+  for (const name of ['华为', '字节跳动', '拼多多', '虾皮', '快手', '长川科技', 'TCL']) {
+    assert.ok(!html.includes(name), `示例规则不得包含真实公司「${name}」`);
+  }
+  assert.ok(!html.includes('章贡区'), '示例规则不得包含真实地名');
+  // 结构:示例仍要示范「多条件 + 一票通过项 + 读不到不放行」
+  assert.ok(html.includes('【黑名单】某某科技、某某网络'), '示例应保留黑名单这个结构');
+  assert.ok(html.includes('读不出来时自己判断'), '示例应保留「读不到不放行」这一条');
+});
+
+test('招呼语面板有「填入示例」，且示例文案不含真实卖点', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="btnSampleGreeting"'), '招呼语面板应有「填入示例」按钮');
+  assert.ok(
+    html.includes('硕士毕业、大厂实习过、项目对口、拿过竞赛奖,很划算的!'),
+    '示例招呼语应存在',
+  );
+  assert.ok(!html.includes('985硕'), '示例招呼语不得包含真实学历');
+  assert.ok(!html.includes('国奖竞赛'), '示例招呼语不得包含真实奖项');
 });
 

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer, evaluateJob, isLoopbackAddress, isRequestAuthorized, loadServerConfig, isCrossOriginWrite } from '../src/server.js';
+import { createIdleExit } from '../src/idleExit.js';
 import { createSettingsStore } from '../src/settings.js';
 
 const JOB_OK = {
@@ -34,6 +35,8 @@ function makeDeps(over = {}) {
       return store;
     })(),
     decideByPrompt: async () => ({ apply: true, reason: '规则命中', fallback: false }),
+    // 默认没配招呼样式 —— 走 AI 生成那条路。配了样式的分支有专门的用例守着。
+    pickGreetingSample: () => '',
     buildGreeting: async () => '您好,我是张三,来自示例大学。',
     ...over,
   };
@@ -140,6 +143,30 @@ test('生成返回空串时退回模板,判定通过仍投递', async () => {
   assert.equal(result.apply, true);
   assert.equal(result.meta.greetingFallback, true);
   assert.match(result.greeting, /张三/);
+});
+
+test('配了招呼样式时原样发出那一条,不再调生成', async () => {
+  // 样例是用户自己写、自己认的内容 —— 直发出去,杜绝模型拿简历自由发挥
+  // (示例简历那回就发出过「我是示例大学张三」)。
+  let greetingCalls = 0;
+  const deps = makeDeps({
+    pickGreetingSample: () => '985硕,大厂实习,很划算的!',
+    buildGreeting: async () => { greetingCalls += 1; return 'AI 生成的句子'; },
+  });
+
+  const result = await evaluateJob(JOB_OK, deps);
+  assert.equal(result.apply, true);
+  assert.equal(result.greeting, '985硕,大厂实习,很划算的!', '样例应原样发出,不被改写');
+  assert.equal(greetingCalls, 0, '样例直发时不该再调一次生成');
+  assert.equal(result.meta.greetingFallback, false, '样例直发不是兜底');
+});
+
+test('没配招呼样式时仍走生成', async () => {
+  const deps = makeDeps({ pickGreetingSample: () => '' });
+
+  const result = await evaluateJob(JOB_OK, deps);
+  assert.match(result.greeting, /张三/, '空样例不该把招呼语变成空串');
+  assert.equal(result.meta.greetingFallback, false);
 });
 
 test('相同 signature 第二次命中缓存,不再调 LLM', async () => {
@@ -910,17 +937,18 @@ test('/api/records 响应里带上每日分组', async () => {
 
   await fetch(`${url}/report`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ company: '甲', at: '2026-09-24T02:00:00.000Z', stage: 'sent' }),
+    body: JSON.stringify({ company: '甲', at: '2026-09-24T02:00:00.000Z', stage: 'sent', verdict: true }),
   });
   await fetch(`${url}/report`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ company: '乙', at: '2026-09-24T06:00:00.000Z', stage: 'skipped' }),
+    body: JSON.stringify({ company: '乙', at: '2026-09-24T06:00:00.000Z', stage: 'skipped', verdict: false }),
   });
 
   const body = await (await fetch(`${url}/api/records?since=0`)).json();
   assert.equal(body.daily.length, 1);
   assert.equal(body.daily[0].sent, 1);
-  assert.equal(body.daily[0].skipped, 1);
+  // 已投递的两个都在已判定里,所以判定数不小于投递数 —— 两条线不是相加关系。
+  assert.equal(body.daily[0].judged, 2);
   // 日期取决于服务进程所在时区,所以只断言格式,不写死具体是哪天。
   assert.match(body.daily[0].date, /^\d{4}-\d{2}-\d{2}$/);
 
@@ -937,5 +965,189 @@ test('isCrossOriginWrite 只拦真正跨站的浏览器请求', () => {
   assert.equal(isCrossOriginWrite({ origin: 'http://evil.example', host: '127.0.0.1:8787' }), true);
   // Origin 解析不了(如字面量 "null")按跨站处理。
   assert.equal(isCrossOriginWrite({ origin: 'null', host: '127.0.0.1:8787' }), true);
+});
+
+// 等一个条件成立。连接断开这类事件不会在 abort() 的同一刻发生,直接断言会时灵时不灵。
+async function waitFor(condition, message) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(message);
+}
+
+test('/api/watch 建立长连接并登记,断开后注销', async () => {
+  const idle = createIdleExit({ graceMs: 60_000, firstGraceMs: 60_000, onIdle: () => {} });
+  const server = makeServer({ idle });
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+
+  const controller = new AbortController();
+  const res = await fetch(`http://127.0.0.1:${port}/api/watch`, { signal: controller.signal });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/event-stream/);
+
+  // 读到第一帧才算连上:服务端是先写响应头、随即登记的,拿到数据就说明已登记。
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  assert.match(new TextDecoder().decode(first.value), /: connected/);
+  assert.equal(idle.count(), 1, '大屏连上就该被算作「有人在看」');
+
+  // 必须主动断开:长连接挂着的话 server.close() 会一直等它。
+  controller.abort();
+  await waitFor(() => idle.count() === 0, '断开后应注销,否则服务永远不会自己退出');
+
+  server.close();
+});
+
+test('/api/watch 在没接 idle 时照样吐流(开发模式 npm start 就是这种)', async () => {
+  const server = makeServer();
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+
+  const controller = new AbortController();
+  const res = await fetch(`http://127.0.0.1:${port}/api/watch`, { signal: controller.signal });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/event-stream/);
+  const first = await res.body.getReader().read();
+  assert.match(new TextDecoder().decode(first.value), /: connected/);
+
+  controller.abort();
+  server.close();
+});
+
+// ---- 大屏「测试连通」 ----
+//
+// 与 AI 接入同一组约束:探测拿的是**页面上当前填的**值(密钥留空则回落到已存的),
+// 而响应体里绝不出现明文密钥。
+
+function testUrl(server) {
+  return `http://127.0.0.1:${server.address().port}/api/ai/test`;
+}
+
+function postTest(server, body, headers = {}) {
+  return fetch(testUrl(server), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+}
+
+test('POST /api/ai/test 用页面上填的端点/模型/密钥探测', async () => {
+  // 用户在保存前先试,试的必须是眼前这份 —— 否则「填了新密钥、测试却用的旧的」会误导人。
+  const store = makeStore();
+  store.save({ aiKey: 'sk-ant-stored-1111' });
+  const seen = [];
+  const server = makeServer({
+    deps: makeDeps({ settings: store, testAi: async (config) => { seen.push(config); } }),
+  });
+  await new Promise((r) => server.listen(0, r));
+
+  const res = await postTest(server, {
+    aiEndpoint: 'https://proxy.example/v1/messages',
+    aiModel: 'my-model',
+    aiKey: 'sk-ant-typed-2222',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.model, 'my-model', '回哪个模型答的 —— 用户要能确认没写错名字');
+  assert.equal(typeof body.ms, 'number', '耗时给页面显示');
+  assert.deepEqual(seen[0], {
+    endpoint: 'https://proxy.example/v1/messages',
+    model: 'my-model',
+    key: 'sk-ant-typed-2222',
+  });
+
+  server.close();
+});
+
+test('POST /api/ai/test 密钥留空时回落到已保存的密钥', async () => {
+  // 密钥框永远不回填,想验证存着的那把就只能留空点测试 ——
+  // 这条与保存时「空 aiKey = 不修改」是同一个约定(见 settings.validatePatch)。
+  const store = makeStore();
+  store.save({ aiKey: 'sk-ant-stored-1111' });
+  const seen = [];
+  const server = makeServer({
+    deps: makeDeps({ settings: store, testAi: async (config) => { seen.push(config); } }),
+  });
+  await new Promise((r) => server.listen(0, r));
+
+  const res = await postTest(server, { aiKey: '' });
+  assert.equal((await res.json()).ok, true);
+  assert.equal(seen[0].key, 'sk-ant-stored-1111');
+  // 没填端点/模型时同样回落到已存配置,不能拿空串去打上游。
+  assert.equal(seen[0].endpoint, 'https://api.anthropic.com/v1/messages');
+  assert.equal(seen[0].model, 'claude-haiku-4-5');
+
+  server.close();
+});
+
+test('POST /api/ai/test 探测失败回 200 + ok:false,并透传上游原话', async () => {
+  const server = makeServer({
+    deps: makeDeps({ testAi: async () => { throw new Error('接口返回 HTTP 401'); } }),
+  });
+  await new Promise((r) => server.listen(0, r));
+
+  const res = await postTest(server, { aiEndpoint: 'https://proxy.example/v1/messages' });
+  // 「问到了上游、上游说不行」不是调用本接口的方式错了,所以照回 200 ——
+  // 大屏只看 ok 决定红绿,不必再分辨 HTTP 状态。
+  assert.equal(res.status, 200);
+
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.error, '接口返回 HTTP 401', '上游给的原话要照搬,编一句「连接失败」等于把线索扔了');
+
+  server.close();
+});
+
+test('POST /api/ai/test 的响应体里不含明文密钥', async () => {
+  // 大屏可以带令牌对局域网开放,探测接口是又一处新的 HTTP 边界。
+  const server = makeServer({ deps: makeDeps({ settings: makeStore(), testAi: async () => {} }) });
+  await new Promise((r) => server.listen(0, r));
+
+  const raw = await (await postTest(server, {
+    aiEndpoint: 'https://proxy.example/v1/messages',
+    aiKey: 'sk-ant-never-echo-9999',
+  })).text();
+  assert.equal(raw.includes('sk-ant-never-echo-9999'), false);
+
+  server.close();
+});
+
+test('POST /api/ai/test 的入参校验与跨站防护', async () => {
+  const seen = [];
+  const server = makeServer({ deps: makeDeps({ testAi: async (config) => { seen.push(config); } }) });
+  await new Promise((r) => server.listen(0, r));
+
+  // 跨站表单拿着 cookie 也能打到这里,先挡住。
+  assert.equal((await postTest(server, {}, { origin: 'http://evil.example' })).status, 403);
+  assert.equal((await postTest(server, '不是 JSON')).status, 400);
+
+  // 端点不是 http(s) 时连探测都不该发出去。
+  const bad = await postTest(server, { aiEndpoint: '这不是地址' });
+  assert.equal(bad.status, 400);
+  assert.match((await bad.json()).error, /http/);
+
+  // 超长入参在这里挡掉:readBody 本身没有大小上限,而这几项会原样进上游请求体。
+  assert.equal((await postTest(server, { aiModel: 'm'.repeat(101) })).status, 400);
+
+  assert.equal(seen.length, 0, '被挡下的请求一个都不该真的发出去');
+
+  server.close();
+});
+
+test('POST /api/ai/test 在服务没接探测能力时回 503', async () => {
+  // makeDeps() 默认不带 testAi。显式报错比 500 好查。
+  const server = makeServer();
+  await new Promise((r) => server.listen(0, r));
+
+  const res = await postTest(server, { aiEndpoint: 'https://proxy.example/v1/messages' });
+  assert.equal(res.status, 503);
+  assert.match((await res.json()).error, /AI 探测/);
+
+  server.close();
 });
 

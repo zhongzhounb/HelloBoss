@@ -7,6 +7,7 @@ import { parseAllResumes, VARIANTS } from './resumeParser.js';
 import { selectVariant, buildJdText } from './variantSelector.js';
 import {
   buildTemplateGreeting,
+  buildProbePrompt,
   callMessagesApi,
   decideByPrompt,
   pickSample,
@@ -14,13 +15,20 @@ import {
 } from './evaluator.js';
 import { createLedger, toCsv } from './ledger.js';
 import { renderDashboardHtml } from './dashboard.js';
-import { createSettingsStore, redactSettings } from './settings.js';
+import { createIdleExit, DEFAULT_GRACE_MS } from './idleExit.js';
+import {
+  createSettingsStore,
+  redactSettings,
+  MAX_ENDPOINT_CHARS,
+  MAX_KEY_CHARS,
+  MAX_MODEL_CHARS,
+} from './settings.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 const PORT = Number(process.env.PORT || 8787);
 // 简历目录。默认是仓库内的 resumes/ —— 里面带了一份示例,所以 clone 下来不配任何
-// 东西也能启动。换成自己的:把 .typ 丢进去,或用 RESUME_SRC 指到别处。
+// 东西也能启动。换成自己的:把简历复制进去(.txt 或 .typ),或用 RESUME_SRC 指到别处。
 const RESUME_SRC = process.env.RESUME_SRC || path.join(ROOT, 'resumes');
 // 超时预算的严格链条:脚本侧等 45 秒 > 服务端最坏 42 秒(判定 30 + 生成 12)。
 // 每层必须小于上一层,否则脚本先断开而服务端还在跑,日志会对不上。
@@ -34,6 +42,12 @@ const GREETING_BUDGET_MS = 12000;
 // 招呼语只有一句话,不需要判定的预算;这个值沿用改造前 server.js 里那份
 // 内联 fetch 写死的 2000,行为不变。
 const GREETING_MAX_TOKENS = 2000;
+// 大屏「测试连通」按钮的预算。它只验证端点能不能回话,不参与判定,所以给得比判定小。
+// 刻意不搬 decideByPrompt 里那套「小预算失败再放大重试」:那套是给判定用的,
+// 抄一份就等于要维护两处预算。代价是推理模型可能因预算被推理吃光而报失败 ——
+// 但那种配置判定本来也会失败,报红是诚实的(错误文案会点明「推理 token 吃光了预算」)。
+const AI_TEST_MAX_TOKENS = 2000;
+const AI_TEST_BUDGET_MS = 15000;
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -42,6 +56,10 @@ function readJson(file) {
 // 手机端看大屏用的 cookie 名。取这个名字是因为「大屏」在本项目里就是它的唯一用途。
 const COOKIE_NAME = 'big_screen_token';
 const COOKIE_MAX_AGE_SECONDS = 2592000;
+
+// 大屏那条长连接的保活间隔。本机连线基本不会被掐,但手机(手机看大屏)连着时,
+// 空闲连接会被省电策略或中间设备断掉,定期写一帧注释行把它吊住。
+const WATCH_HEARTBEAT_MS = 25000;
 
 const SERVER_CONFIG_FILE = path.join(ROOT, 'config', 'server.json');
 
@@ -197,7 +215,7 @@ export async function evaluateJob(job, deps) {
   if (!profile) {
     return {
       apply: false,
-      reason: '尚未加载简历,已跳过该岗位 —— 请把 .typ 简历放进 resumes/ 目录',
+      reason: '尚未加载简历,已跳过该岗位 —— 请把简历(.txt / .typ)放进 resumes/ 目录',
       greeting: '',
       meta: { ...baseMeta, fallback: true, noResume: true, latencyMs: Date.now() - startedAt },
     };
@@ -240,19 +258,30 @@ export async function evaluateJob(job, deps) {
   let greetingFallback = false;
 
   if (decision.apply) {
-    try {
-      const generated = await deps.buildGreeting(job, profile);
-      if (generated) {
-        greeting = generated;
-      } else {
+    // 用户在「打招呼样式」里配了样例,就原样发那一条,**不经过模型**。
+    //
+    // 模型拿简历自由发挥时,会把简历里没有的东西也写进句子 —— 示例简历那回就发过
+    // 「我是示例大学张三,技能方向是语言和工具」。样例是用户自己写、自己认的内容,
+    // 发出去的每个字都可控,比让模型润色更接近他想要的招呼语。
+    const sample = deps.pickGreetingSample ? deps.pickGreetingSample() : '';
+    if (sample) {
+      greeting = sample;
+    } else {
+      // 没配样式才退回 AI 生成(以及生成失败时的模板兜底)。
+      try {
+        const generated = await deps.buildGreeting(job, profile);
+        if (generated) {
+          greeting = generated;
+        } else {
+          greeting = buildTemplateGreeting(profile, job);
+          greetingFallback = true;
+        }
+      } catch {
+        // 判定已通过,只是措辞生成失败 —— 退回模板照常投。
+        // 这与判定失败不同:岗位本身是合适的,不该因为一句措辞丢掉。
         greeting = buildTemplateGreeting(profile, job);
         greetingFallback = true;
       }
-    } catch {
-      // 判定已通过,只是措辞生成失败 —— 退回模板照常投。
-      // 这与判定失败不同:岗位本身是合适的,不该因为一句措辞丢掉。
-      greeting = buildTemplateGreeting(profile, job);
-      greetingFallback = true;
     }
   }
 
@@ -269,11 +298,13 @@ export async function evaluateJob(job, deps) {
   };
 }
 
-// 生成招呼语:用 LLM 把简历事实和 JD 措辞对上。失败也返回空串,由上层兜底。
+// 生成招呼语:用 LLM 把简历事实和 JD 措辞对上。
+//
+// 只在用户**没配**「打招呼样式」时才会走到这里 —— 配了样式的话,evaluateJob 直接
+// 把那条样例原样发出去,不经过模型。失败返回空串,由调用方退回模板兜底。
 async function buildGreetingViaLlm(job, profile, options) {
-  const { callLlm, sample } = options;
-  // 风格要求由 options.sample 提供(用户在设置页填的样例里随机挑一条,没填则为空串)。
-  const system = buildGreetingSystemPrompt(sample);
+  const { callLlm } = options;
+  const system = buildGreetingSystemPrompt();
 
   const user = [
     `简历:${profile.name},${profile.sections.education[0]?.title || ''},技能方向:${profile.sections.skills.map((s) => s.label).join('、')}`,
@@ -301,6 +332,10 @@ export function createServer(options = {}) {
   // 它存在的意义是让测试能把豁免关掉,从而覆盖到鉴权分支。
   const token = String(options.token || '').trim();
   const allowLoopback = options.allowLoopback !== false;
+
+  // 谁在看大屏(见 src/idleExit.js)。不传 = 不记账,服务也不会自己退出,
+  // 这是 npm start 与绝大多数测试的用法。
+  const idle = options.idle || null;
 
   const cache = new Map();
 
@@ -348,6 +383,39 @@ export function createServer(options = {}) {
           profiles: deps.profiles.length,
           cache: cache.size,
           aiConfigured: Boolean(String(current.aiKey || '').trim()),
+        });
+        return;
+      }
+
+      // 大屏页面在这里挂一条长连接:这条连接在 = 有人看着,断了 = 页面关了。
+      // 服务据此自己退出(见 src/idleExit.js)。刻意放在鉴权之后 —— EventSource
+      // 不能自定义请求头,但同源请求会带上大屏的令牌 cookie,所以手机侧也走得通。
+      if (req.method === 'GET' && pathname === '/api/watch') {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          // 不能让浏览器或中间层把这个流缓存、攒起来,否则「页面关了」这个信号会迟到。
+          'cache-control': 'no-store',
+          // 刻意不设 content-length:长度未知的流走 chunked 编码,设了就写不出去。
+        });
+
+        // 先写一帧,让页面立刻收到响应头 —— EventSource 拿到第一块数据才触发 onopen。
+        res.write(': connected\n\n');
+
+        // 往一个刚断掉的 socket 写会触发 error 事件,没人接就是未捕获异常、直接把服务带走。
+        // 这条连接死了无所谓,服务不能跟着死。
+        res.on('error', () => {});
+
+        const release = idle ? idle.add(res) : null;
+        // 定期写一帧注释行(EventSource 会忽略它)。它不只是保活:客户端进程被强杀时
+        // 不会发 FIN,只有这次写失败才能让服务端察觉到连接已经没了。
+        const ping = setInterval(() => {
+          if (res.writableEnded || res.destroyed) return;
+          res.write(': ping\n\n');
+        }, WATCH_HEARTBEAT_MS);
+
+        res.on('close', () => {
+          clearInterval(ping);
+          if (release) release();
         });
         return;
       }
@@ -456,6 +524,62 @@ export function createServer(options = {}) {
         }
       }
 
+      // 大屏「测试连通」:拿页面上当前填的端点/模型/密钥实际打一次上游,把结论回给页面。
+      // 刻意不落盘 —— 用户是在保存前先试,试通了再保存。
+      if (req.method === 'POST' && pathname === '/api/ai/test') {
+        if (isCrossOriginWrite(req.headers)) {
+          sendJson(res, 403, { error: '拒绝跨站写入' });
+          return;
+        }
+        if (!deps.testAi) {
+          sendJson(res, 503, { error: '服务未启用 AI 探测' });
+          return;
+        }
+
+        const raw = await readBody(req);
+        let payload;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          sendJson(res, 400, { error: '请求体不是合法 JSON' });
+          return;
+        }
+
+        // 三个字段都「页面上填了就用页面上的,留空回落到已保存的」—— 尤其是密钥:
+        // 密钥框永远不回填,留空就意味着「用存好的那把」,与保存时「空 aiKey = 不修改」
+        // 是同一个约定(见 settings.validatePatch)。
+        const stored = deps.settings ? deps.settings.get() : {};
+        const config = {
+          endpoint: String(payload.aiEndpoint || stored.aiEndpoint || '').trim(),
+          model: String(payload.aiModel || stored.aiModel || '').trim(),
+          key: String(payload.aiKey || stored.aiKey || '').trim(),
+        };
+
+        // readBody 没有大小上限,而这三项最终会原样进上游的请求体 —— 在这里挡一道。
+        if (config.endpoint.length > MAX_ENDPOINT_CHARS
+          || config.model.length > MAX_MODEL_CHARS
+          || config.key.length > MAX_KEY_CHARS) {
+          sendJson(res, 400, { error: '端点 / 模型 / 密钥超出长度上限' });
+          return;
+        }
+        if (!/^https?:\/\//i.test(config.endpoint)) {
+          sendJson(res, 400, { error: '端点需要以 http:// 或 https:// 开头' });
+          return;
+        }
+
+        const startedAt = Date.now();
+        try {
+          await deps.testAi(config);
+          // 响应体里只出结论与模型名。明文密钥绝不进响应体 —— 大屏可以带令牌对局域网开放。
+          sendJson(res, 200, { ok: true, ms: Date.now() - startedAt, model: config.model });
+        } catch (error) {
+          // 探测失败是「问到了上游、上游说不行」(密钥错 / 端点错 / 超时),不是调用本接口的
+          // 方式错了,所以照回 200 —— 大屏只看 ok 决定红绿,不必再分辨 HTTP 状态。
+          sendJson(res, 200, { ok: false, ms: Date.now() - startedAt, error: error.message });
+        }
+        return;
+      }
+
       if (req.method === 'GET' && pathname === '/api/export.csv') {
         // BOM 不能省:没有它 Excel 会把中文读成乱码。
         const body = `\uFEFF${toCsv(ledger.all())}`;
@@ -511,7 +635,7 @@ function loadProfiles(srcDir) {
   try {
     const profiles = parseAllResumes(srcDir);
     if (!profiles.length) {
-      console.warn(`[resume] ${srcDir} 里没有可用的 .typ 简历 —— 判定将全部跳过`);
+      console.warn(`[resume] ${srcDir} 里没有可用的简历(.txt / .typ)—— 判定将全部跳过`);
     }
     return profiles;
   } catch (error) {
@@ -549,10 +673,11 @@ function buildDefaultDeps() {
         budgetMs: DECISION_BUDGET_MS,
         ai: aiConfig(),
       }),
+    // 配了招呼样式就原样发(在 evaluateJob 里直接返回,不调模型);没配才轮到下面的
+    // 生成。每次现取一次,大屏上改完立即生效,不必重启服务。
+    pickGreetingSample: () => pickSample(settings.get().greetingSamples),
     buildGreeting: (job, profile) =>
       buildGreetingViaLlm(job, profile, {
-        // 每次生成都现取一次样例 —— 大屏上改完立即生效,不必重启服务。
-        sample: pickSample(settings.get().greetingSamples),
         // 生成也要有超时。没有上限的话,端点卡住时服务端会一直挂着,
         // 直到脚本侧 45 秒超时断开 —— 请求白做,还占着连接。
         // 请求头、请求体、超时现在统一由 callMessagesApi 负责(与判定共用同一处),
@@ -566,6 +691,18 @@ function buildDefaultDeps() {
             timeoutMs: GREETING_BUDGET_MS,
           }),
       }),
+    // 大屏「测试连通」用。与判定、招呼语共用 callMessagesApi 这一处调用 ——
+    // 请求头、请求体、超时都不另抄一份,否则加配置时要改两个地方。
+    testAi: (config) => {
+      const probe = buildProbePrompt();
+      return callMessagesApi({
+        ...config,
+        system: probe.system,
+        user: probe.user,
+        maxTokens: AI_TEST_MAX_TOKENS,
+        timeoutMs: AI_TEST_BUDGET_MS,
+      });
+    },
   };
 }
 
@@ -582,29 +719,93 @@ export function lanAddresses() {
   return result;
 }
 
-// 直接用 node src/server.js 启动时才监听;被测试 import 时不启动。
-if (process.argv[1] && process.argv[1].endsWith('server.js')) {
-  let serverConfig;
-  try {
-    serverConfig = loadServerConfig();
-  } catch (error) {
-    // 配置错误直接给人话并退出,别让栈把真正的原因冲掉。
-    console.error(`[boss-ai-gate] 启动失败:${error.message}`);
-    process.exit(1);
+/**
+ * 启动服务并开始监听,返回 http.Server。
+ *
+ * 两个入口共用这一处:「node src/server.js」(以及 .cmd / .vbs)和打包出来的
+ * HelloBoss.exe 的引导脚本。所以它只负责「起服务」,不管任何与启动方式有关的
+ * 事(开浏览器、建快捷方式)—— 那些留给各自的入口。
+ *
+ * 配置错误会抛出去而不是自己 process.exit:exe 那侧要先把错误写进日志、再弹窗
+ * 告诉用户,而不是当作「服务偷偷没起来」。
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.exitWhenIdle] 覆盖「大屏关了自动退出」,不传则看环境变量
+ */
+export function startServer(options = {}) {
+  // SERVER_CONFIG 与 RESUME_SRC 同理:让测试能指到别处的配置,不去读、不去碰
+  // 本机真实的 config/server.json —— 否则一旦本机开过局域网访问(lan: true),
+  // 「页面关了自动退出」这条路径的用例就会随本机状态时灵时不灵。
+  const serverConfig = loadServerConfig(process.env.SERVER_CONFIG || undefined);
+
+  // 「大屏页面关掉就把服务停掉」只在走「双击 打开大屏.vbs / HelloBoss.exe」
+  // 这条路径时生效 —— 启动服务.cmd 会设这个变量。两种情况下不生效:
+  //   npm start:开发调试用法,页面关了它还得继续跑;
+  //   对局域网开放:那时服务是给整个局域网用的,不该由某一个标签页决定生死
+  //   (否则手机上随手关掉大屏,正在跑脚本的那台机器就没了判定服务)。
+  const exitWhenIdle = (options.exitWhenIdle ?? process.env.BOSS_EXIT_WHEN_IDLE === '1')
+    && !serverConfig.lan;
+
+  // 顺序:记账器要先建出来才能交给 createServer,而它的 onIdle 又要用到 server,
+  // 所以 server 先声明后赋值 —— 别改成 const,那样会踩到暂时性死区。
+  let server = null;
+  let exiting = false;
+
+  function shutdown(reason) {
+    if (exiting) return;
+    exiting = true;
+    console.log(`[HelloBoss] ${reason},服务退出`);
+
+    // 先让在看的页面收尾:把大屏那条流结束掉,连接回到空闲,close() 才收得回来。
+    // 刻意不用 closeAllConnections() —— 那会把正在跑的判定请求一起掐掉,
+    // 白白废掉油猴脚本那 45 秒的等待预算。
+    if (idle) idle.releaseAll();
+    server.close(() => process.exit(0));
+
+    // 兜底:close() 万一被残留的 socket 卡住,这个隐藏进程就既退不掉、用户也察觉不到。
+    // 45 秒取自脚本侧的等待预算 —— 过了这个点,已经没有人在等它的回答了。
+    setTimeout(() => {
+      console.log('[HelloBoss] 收尾超时,强制退出');
+      process.exit(0);
+    }, 45_000).unref();
   }
 
-  const server = createServer({ token: serverConfig.token });
+  const idle = exitWhenIdle
+    ? createIdleExit({
+      // 环境变量只给测试和调试用(测试要让它几毫秒就退,不然一个用例要等一分钟)。
+      graceMs: Number(process.env.BOSS_IDLE_GRACE_MS) || DEFAULT_GRACE_MS,
+      onIdle: () => shutdown('大屏已关闭'),
+    })
+    : null;
+
+  server = createServer({ token: serverConfig.token, idle });
   // lan 用 '::' 而不是 '0.0.0.0' —— 后者只绑 IPv4,手机侧解析到 IPv6 就连不上。
   const host = serverConfig.lan ? '::' : '127.0.0.1';
 
   server.listen(PORT, host, () => {
-    console.log(`[boss-ai-gate] 监听 http://127.0.0.1:${PORT}`);
-    console.log(`[boss-ai-gate] 健康检查 http://127.0.0.1:${PORT}/health`);
+    console.log(`[HelloBoss] 监听 http://127.0.0.1:${PORT}`);
+    console.log(`[HelloBoss] 健康检查 http://127.0.0.1:${PORT}/health`);
+    // 页面还没连上之前先给一段宽限,免得「服务刚起来、Edge 还没渲染出大屏」就被判成没人看。
+    if (idle) idle.start();
     if (!serverConfig.lan) return;
 
-    console.log('[boss-ai-gate] 已对局域网开放(非本机访问需要令牌)');
+    console.log('[HelloBoss] 已对局域网开放(非本机访问需要令牌)');
     for (const address of lanAddresses()) {
-      console.log(`[boss-ai-gate] 手机访问 http://${address}:${PORT}/dashboard?token=${serverConfig.token}`);
+      console.log(`[HelloBoss] 手机访问 http://${address}:${PORT}/dashboard?token=${serverConfig.token}`);
     }
   });
+
+  return server;
+}
+
+// 直接用 node src/server.js 启动时才监听;被测试 import、或者被 exe 的引导脚本
+// import 时都不走这里(后者自己调 startServer,并且要额外开浏览器)。
+if (process.argv[1] && process.argv[1].endsWith('server.js')) {
+  try {
+    startServer();
+  } catch (error) {
+    // 配置错误直接给人话并退出,别让栈把真正的原因冲掉。
+    console.error(`[HelloBoss] 启动失败:${error.message}`);
+    process.exit(1);
+  }
 }

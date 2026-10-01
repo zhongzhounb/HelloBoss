@@ -9,7 +9,7 @@ export function renderDashboardHtml(options = {}) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>岗位判定大屏</title>
+<title>HelloBoss</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -45,6 +45,10 @@ export function renderDashboardHtml(options = {}) {
   #svcBtn.up { border-color: #238636; color: #3fb950; background: #12261a; }
   #svcBtn.down { border-color: #6e2b28; color: #f85149; background: #2d1416; }
 
+  /* 顶栏里那行说明:也是次要文字,但在 flex 行里要换成「把剩余空间吃掉」的左外边距,
+     好让它和状态灯一起靠右,同时抵掉 .hint 自带的下外边距(否则会比按钮低一点点)。 */
+  .topbar .hint { margin: 0 0 0 auto; }
+
   /* ---- 上半:四个面板等宽 ---- */
   .top { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
          gap: 12px; height: 300px; min-height: 0; }
@@ -53,6 +57,10 @@ export function renderDashboardHtml(options = {}) {
            background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; }
   .panel h2 { margin: 0 0 3px; font-size: 13px; font-weight: 600; }
   .hint { margin: 0 0 7px; font-size: 11px; color: #6e7681; }
+  /* 筛选倍数:这张图最该被一眼看到的数,所以单独占一行、字号明显大于正文,用「已投递」
+     同款绿色。tabular-nums 让数字位数变化时不左右跳动。 */
+  .ratio { margin: 0 0 6px; font-size: 20px; font-weight: 700; color: #3fb950;
+           font-variant-numeric: tabular-nums; }
 
   textarea { flex: 1; width: 100%; min-height: 0; resize: none; background: #0d1117;
              color: #e6edf3; border: 1px solid #30363d; border-radius: 6px;
@@ -176,7 +184,8 @@ export function renderDashboardHtml(options = {}) {
 <div class="screen">
   <div class="head">
     <div class="topbar">
-      <h1>岗位判定大屏</h1>
+      <h1>HelloBoss</h1>
+      <span class="hint">服务跟着本页:最小化不影响,关掉这个标签页后服务会自动停止</span>
       <button id="svcBtn" type="button" title="点一下立即重新检测服务状态">启动中</button>
     </div>
     <div id="ruleWarn">
@@ -185,7 +194,8 @@ export function renderDashboardHtml(options = {}) {
     </div>
     <div id="profileWarn">
       没加载到简历,当前<strong>不会投递任何岗位</strong>。
-      把 .typ 简历放进服务目录的 resumes/ 里,然后重启服务 —— 判定要靠简历才能对岗位做取舍。
+      把简历放进服务目录的 resumes/ 里(复制 example.txt、改成别的文件名就行,也可以用 .typ),然后重启服务 ——
+      判定要靠简历才能对岗位做取舍。
     </div>
   </div>
 
@@ -203,21 +213,24 @@ export function renderDashboardHtml(options = {}) {
 
     <section class="panel">
       <h2>打招呼样式</h2>
-      <p class="hint">每次随机挑一条作为招呼语的风格要求</p>
+      <p class="hint">配了就随机挑一条<strong>原样发出</strong>;不填才由 AI 根据简历生成</p>
       <div class="samples" id="samples"></div>
       <div class="panel-foot">
         <button id="btnAddSample" type="button">添加样式</button>
+        <button id="btnSampleGreeting" type="button">填入示例</button>
         <span class="status" id="sampleStatus"></span>
       </div>
     </section>
 
     <section class="panel">
       <h2>每日投递量</h2>
-      <p class="hint">未沟通 = 当天所有没发出去的岗位(含前置跳过与判定不投)</p>
+      <p class="hint">已判定 = 当天拿到 AI 判定结论的岗位(含已投递);黑名单 / 已沟通等前置跳过未走到判定,不计入</p>
+      <span class="ratio" id="ratio"
+            title="最近 7 天:已判定 ÷ 已投递。倍数越高 = 每投出 1 份要判掉越多份,衡量的是筛选力度,不是投递效果。窗口内已投递不足 20 份时样本太小,不显示数字"></span>
       <div class="chart" id="chart"></div>
       <div class="legend">
-        <span><i class="ok"></i>已沟通</span>
-        <span><i class="no"></i>未沟通</span>
+        <span><i class="ok"></i>已投递</span>
+        <span><i class="no"></i>已判定</span>
         <span class="legend-note">最近 7 天</span>
       </div>
     </section>
@@ -241,6 +254,7 @@ export function renderDashboardHtml(options = {}) {
       </div>
       <div class="panel-foot">
         <button id="btnAiSave" type="button">保存</button>
+        <button id="btnAiTest" type="button" title="用当前填的端点 / 密钥 / 模型实际打一次上游">测试连通</button>
         <button id="btnAiClear" type="button" title="清除已保存的密钥">清除密钥</button>
         <span class="status" id="aiStatus"></span>
       </div>
@@ -276,17 +290,33 @@ export function renderDashboardHtml(options = {}) {
   var MAX_ROWS = ${maxRows};
   // 图表窗口天数。再往前的记录仍然在表格和 CSV 里,只是不画进柱子。
   var CHART_DAYS = 7;
+  // 显示筛选倍数所需的最少已投递数(窗口内累计)。样本太少时比值没有意义 ——
+  // 投出 1 份、判掉 3 份也能算出 ×3.00,但那什么都说明不了,反而会被当成结论。
+  var MIN_SENT_FOR_RATIO = 20;
 
-  // 「填入示例」用的起步模板。刻意写成大白话的编号条目 —— 它是给第一次用的人
-  // 一个能照着改的起点,而不是一份要原样保留的配置。数字全是举例,进去就得改。
+  // 「填入示例」用的起步模板。**每一句都是编的**:城市、公司、数字全部脱敏 ——
+  // 照抄不改会按一份不是你的标准投递,而招呼语发出去收不回来。
+  //
+  // 保留下来的是**结构**而不是内容:多条件 + 一票通过项 + 「读不出来就不放行」。
+  // 这套结构才是示例的价值所在,它示范了自然语言规则能写到多细。
   var SAMPLE_RULE = [
-    '【下面只是示例,请按自己的情况改掉城市、规模和薪资数字】',
-    '1. 工作地:只投北京、上海、深圳、杭州的岗位。',
-    '2. 岗位:只投开发和测试岗;产品、运营、销售一律不投。',
-    '3. 公司:优先知名大厂;1000 人以上的互联网公司也可以;1000 人以下的初创公司不投。',
-    '4. 薪资:月薪下限 20K 以上的岗位直接投,不用再看其它条件。',
-    '5. 城市、公司规模、薪资这些信息读不出来时,不要放行。',
+    '【下面只是示例,请按自己的情况整段改掉】',
+    '1. 岗位要和软件相关(开发、测试这类),算法岗不投。',
+    '2. 月薪下限 13K 起,低于这个数不投。',
+    '3. 黑名单里的公司不投。',
+    '4. 满足任意一条就投:',
+    '   ① 月薪下限 20K 以上;',
+    '   ② 1000 人以上的互联网/软件公司(银行、车企、国企这类传统企业,只要设有成规模研发中心的也算);',
+    '   ③ 10000 人以上的非互联网公司;',
+    '   ④ 公司在某市(地点可以一票通过)。',
+    '5. 公司规模、薪资读不出来时自己判断;判断不了就不要放行。',
+    '【黑名单】某某科技、某某网络',
   ].join('\\n');
+
+  // 「填入示例」用的招呼语模板。**这一条会被原样发出去** —— 配了样式就不经过模型
+  // (见 server 侧 pickSample)。所以它不能像规则那样加一行【只是示例】的护栏:
+  // 那个前缀会变成一句荒唐的开场白。护栏只能放在点击后的状态提示里。
+  var SAMPLE_GREETING = '硕士毕业、大厂实习过、项目对口、拿过竞赛奖,很划算的!';
 
   var since = 0;
   var scope = 'current';
@@ -309,6 +339,7 @@ export function renderDashboardHtml(options = {}) {
   var bannerEl = document.getElementById('banner');
   var scopeBtn = document.getElementById('btnScope');
   var chartEl = document.getElementById('chart');
+  var ratioEl = document.getElementById('ratio');
   var promptEl = document.getElementById('decisionPrompt');
   var promptBtn = document.getElementById('btnPrompt');
   var promptStatusEl = document.getElementById('promptStatus');
@@ -317,12 +348,14 @@ export function renderDashboardHtml(options = {}) {
   var profileWarnEl = document.getElementById('profileWarn');
   var samplesEl = document.getElementById('samples');
   var addSampleBtn = document.getElementById('btnAddSample');
+  var sampleGreetingBtn = document.getElementById('btnSampleGreeting');
   var sampleStatusEl = document.getElementById('sampleStatus');
   var svcBtn = document.getElementById('svcBtn');
   var aiEndpointEl = document.getElementById('aiEndpoint');
   var aiKeyEl = document.getElementById('aiKey');
   var aiModelEl = document.getElementById('aiModel');
   var aiSaveBtn = document.getElementById('btnAiSave');
+  var aiTestBtn = document.getElementById('btnAiTest');
   var aiClearBtn = document.getElementById('btnAiClear');
   var aiStatusEl = document.getElementById('aiStatus');
 
@@ -423,6 +456,7 @@ export function renderDashboardHtml(options = {}) {
   function renderChart() {
     if (!daily.length) {
       chartEl.innerHTML = '<div class="empty">暂无数据</div>';
+      ratioEl.textContent = '';
       return;
     }
 
@@ -437,15 +471,34 @@ export function renderDashboardHtml(options = {}) {
       var day = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() - back);
       var key = localDateKey(day);
       var hit = byDate[key];
-      days.push({ key: key, sent: hit ? hit.sent : 0, skipped: hit ? hit.skipped : 0 });
+      days.push({ key: key, sent: hit ? hit.sent : 0, judged: hit ? hit.judged : 0 });
     }
 
+    // 已投递 ⊆ 已判定,两根柱子是包含关系而不是「一部分 + 一部分」,所以不能按两者之和
+    // 缩放 —— 那会让每天都只剩半截。取窗口内两根柱子里的最大值统一缩放,高度才可比。
     var max = 0;
     for (var d = 0; d < days.length; d++) {
-      max = Math.max(max, days[d].sent + days[d].skipped);
+      max = Math.max(max, days[d].sent, days[d].judged);
     }
 
-    // 柱子高度按当天总数相对窗口内最大值缩放。上限留 88% 而不是 100% —— 柱子顶部
+    // 筛选倍数 = 已判定 ÷ 已投递,在窗口内先各自求和再相除。
+    // 不能把每天的比值再平均 —— 投递少的那些天会被等权,把一个几乎没跑的日子算成和大日子一样重。
+    // 它衡量的是「筛选力度」而不是「效果」:每日投递有上限,倍数高只说明捞进来的岗位里
+    // 大部分被判掉了(规则严,或者搜索条件开太宽),不代表挑得准。
+    // 分母为 0(窗口中一份都没投出去)时不能说 0 也不能说 Infinity,给个占位符。
+    var sumSent = 0;
+    var sumJudged = 0;
+    for (var r = 0; r < days.length; r++) {
+      sumSent += days[r].sent;
+      sumJudged += days[r].judged;
+    }
+    // 已投递不足阈值就不给数字,退回占位符 —— 见 MIN_SENT_FOR_RATIO 的说明。
+    // 这个条件同时兜住了分母为 0:sumSent ≥ 20 必然 > 0。
+    ratioEl.textContent = sumSent >= MIN_SENT_FOR_RATIO
+      ? '筛选倍数 ×' + (sumJudged / sumSent).toFixed(2)
+      : '筛选倍数 --';
+
+    // 柱子高度按各自的值相对窗口内最大值缩放。上限留 88% 而不是 100% —— 柱子顶部
     // 要压一个数字标签,占满高度的话最高的一根会把标签顶出 .bars 容器。
     // 非零值再兜一个 2% 的下限:舍入到 0 会让「跑过但只成功一条」的一整天
     // 在图上完全消失,与「没跑」看着一样。
@@ -456,7 +509,7 @@ export function renderDashboardHtml(options = {}) {
 
     chartEl.innerHTML = days.map(function (day) {
       var label = day.key.slice(5);
-      var tip = label + ' 已沟通 ' + day.sent + ' / 未沟通 ' + day.skipped;
+      var tip = label + ' 已投递 ' + day.sent + ' / 已判定 ' + day.judged;
       return '<div class="day" title="' + attr(tip) + '">' +
         '<div class="bars">' +
           '<div class="barcol">' +
@@ -464,8 +517,8 @@ export function renderDashboardHtml(options = {}) {
             '<div class="bar ok" style="height:' + heightOf(day.sent) + '%"></div>' +
           '</div>' +
           '<div class="barcol">' +
-            '<span class="bar-val no">' + day.skipped + '</span>' +
-            '<div class="bar no" style="height:' + heightOf(day.skipped) + '%"></div>' +
+            '<span class="bar-val no">' + day.judged + '</span>' +
+            '<div class="bar no" style="height:' + heightOf(day.judged) + '%"></div>' +
           '</div>' +
         '</div>' +
         '<div class="day-label">' + cell(label) + '</div>' +
@@ -496,38 +549,50 @@ export function renderDashboardHtml(options = {}) {
 
   // ---- 服务状态 ----
 
-  // 这个按钮只能当状态灯用,不能真的去启动服务:页面本身就是那个服务吐出来的,
-  // 服务死了这一页根本打不开,浏览器也没有权限去拉起你电脑上的 node 进程。
-  // 所以它反映的是「页面连不连得上服务」,与表格用同一份信号。
-  var svcState = 'starting';
+  // 这盏灯只有一个写入者:那条一直挂着的大屏连接(/api/watch)。
+  // 连接在 = 服务在,连接断 = 服务没了;EventSource 自己会重连,重连上就又变绿。
+  // 之所以要「只有一个写入者」:以前 1.5 秒一次的 poll() 失败也会把灯拨红,
+  // 于是 /api/records 偶发抖动就会出现「服务好好的,灯却是红的」——
+  // 多个地方各写各的,谁也说不清当前是什么状态。
+  // 这个按钮只能当状态灯和手动重连用,不能真的去启动服务:页面本身就是那个服务
+  // 吐出来的,浏览器也没有权限去拉起你电脑上的 node 进程。
+  var watch = null;
 
   function setSvcState(state) {
-    svcState = state;
     svcBtn.classList.toggle('up', state === 'up');
     svcBtn.classList.toggle('down', state === 'down');
     svcBtn.textContent = state === 'up' ? '服务运行中'
       : (state === 'down' ? '服务未连接' : '启动中');
   }
 
-  function checkService() {
-    setSvcState('starting');
-    fetch('/health')
-      .then(function (res) {
-        setSvcState(res.ok ? 'up' : 'down');
-        if (!res.ok) return null;
-        return res.json();
-      })
-      .then(function (health) {
-        if (!health) return;
-        // 一份简历都没有 = 判定会全部跳过。这和「没写规则」是两回事,但后果一样
-        // (一个岗位都投不出去),所以用同样醒目的整条警告说清楚,而不是让人
-        // 去猜为什么岗位全被跳过。
-        profileWarnEl.classList.toggle('show', health.profiles === 0);
-      })
-      .catch(function () { setSvcState('down'); });
+  // 挂上这条连接。服务端靠它判断「还有人在看大屏」——页面关掉这条连接就断了,
+  // 服务会在宽限期后自己退出。重连(刷新、切回来、断线重试)由 EventSource 负责。
+  function openWatch() {
+    if (watch) watch.close();
+    watch = new EventSource('/api/watch');
+    watch.addEventListener('open', function () { setSvcState('up'); });
+    // 这里不区分「服务没了」和「网络抖了一下」:连不上就是连不上,重连成功自然会回到绿色。
+    watch.addEventListener('error', function () { setSvcState('down'); });
   }
 
-  svcBtn.addEventListener('click', checkService);
+  // 只为「没加载到简历」那条警告条去查 /health:一份简历都没有 = 一个岗位都投不出去,
+  // 这个原因必须写在页面上,不能让人去猜岗位为什么全被跳过。
+  function checkProfile() {
+    fetch('/health')
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (health) {
+        if (!health) return;
+        profileWarnEl.classList.toggle('show', health.profiles === 0);
+      })
+      // 查不到就维持现状,别把警告条闪一下又收回去。
+      .catch(function () {});
+  }
+
+  svcBtn.addEventListener('click', function () {
+    setSvcState('starting');
+    openWatch();
+    checkProfile();
+  });
 
   function poll() {
     if (inflight) return;
@@ -537,7 +602,6 @@ export function renderDashboardHtml(options = {}) {
       .then(function (res) { return res.json(); })
       .then(function (data) {
         bannerEl.classList.remove('show');
-        if (svcState !== 'up') setSvcState('up');
 
         // runId 变化 = 服务端重启;seq 回退到本地游标之下 = 文件被清空。
         // 两种情况本地 since 都已失效,表现为"连接正常却再也不更新"且没有 banner。
@@ -564,17 +628,17 @@ export function renderDashboardHtml(options = {}) {
       })
       .catch(function () {
         // 服务可能刚重启或短暂不可达 —— 提示但不停止重试,页面也不清空。
+        // 状态灯不在这里改:它的唯一依据是那条大屏连接,见 openWatch()。
         bannerEl.classList.add('show');
-        setSvcState('down');
       })
       .finally(function () { inflight = false; });
   }
 
   // ---- 配置读写 ----
 
-  // 统一的写入入口。返回 Promise,调用方自己决定成功/失败怎么呈现。
-  function postSettings(patch) {
-    return fetch('/api/settings', {
+  // 统一的 POST JSON 入口(保存配置、测试连通都走它)。返回 Promise,调用方自己决定怎么呈现。
+  function postJson(url, patch) {
+    return fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -586,6 +650,10 @@ export function renderDashboardHtml(options = {}) {
         return data;
       });
     });
+  }
+
+  function postSettings(patch) {
+    return postJson('/api/settings', patch);
   }
 
   function setStatus(el, text, tone) {
@@ -671,7 +739,7 @@ export function renderDashboardHtml(options = {}) {
     // 新增行挂在列表末尾,与「添加样式」按钮的位置一致。
     if (editingIndex === samples.length) {
       html += '<div class="sample editing">' +
-        '<input id="sampleInput" placeholder="例如:985硕，大厂实习">' +
+        '<input id="sampleInput" placeholder="例如:硕士毕业，大厂实习">' +
         '<button type="button" data-act="commit" data-i="' + samples.length + '">添加</button>' +
         '<button type="button" data-act="cancel">取消</button>' +
         '</div>';
@@ -688,14 +756,16 @@ export function renderDashboardHtml(options = {}) {
     if (input) input.focus();
   }
 
-  function persistSamples(next) {
+  function persistSamples(next, successText) {
     setStatus(sampleStatusEl, '保存中…', '');
     return postSettings({ greetingSamples: next })
       .then(function (data) {
         // 以服务端清洗后的结果为准 —— 它会 trim、丢空行,本地照抄一份迟早会不一致。
         samples = (data.settings && data.settings.greetingSamples) || [];
         editingIndex = -1;
-        setStatus(sampleStatusEl, '已保存', 'ok');
+        // 普通保存显示「已保存」;载入示例复用同一条落盘路径时,换成提醒用户去改的那句 ——
+        // 招呼语是原样发出去的,这句提示是唯一的护栏。
+        setStatus(sampleStatusEl, successText || '已保存', 'ok');
         renderSamples();
       })
       .catch(function (error) {
@@ -760,6 +830,16 @@ export function renderDashboardHtml(options = {}) {
     renderSamples();
   });
 
+  sampleGreetingBtn.addEventListener('click', function () {
+    if (samples.length) {
+      // 和规则面板同一条规矩:示例只给空列表起步,不覆盖已经调好的样式。
+      // 这条不能省 —— samples 是原样发出去的,覆盖等于把用户在用的招呼语悄悄换掉。
+      setStatus(sampleStatusEl, '已有样式,没有覆盖', '');
+      return;
+    }
+    persistSamples([SAMPLE_GREETING], '已填入示例,按你的情况改完再保存');
+  });
+
   // ---- AI 接入 ----
 
   // 密钥框永远不回填明文(服务端也根本不回传),所以「已配置 / 未配置」只能靠提示文字
@@ -786,8 +866,8 @@ export function renderDashboardHtml(options = {}) {
         var saved = (data && data.settings) || {};
         setKeyHint(saved.hasAiKey, saved.aiKeyHint);
         setStatus(aiStatusEl, '已保存,下一个岗位立即生效', 'ok');
-        // 重探一次服务状态:大屏顶部的提示条依赖 /health 里的 aiConfigured。
-        checkService();
+        // 重查一次简历那条警告:清了密钥之后后果会变(判定全跳过),得让人当场看见。
+        checkProfile();
       })
       .catch(function (error) {
         setStatus(aiStatusEl, error.message || String(error), 'bad');
@@ -796,6 +876,35 @@ export function renderDashboardHtml(options = {}) {
   }
 
   aiSaveBtn.addEventListener('click', saveAi);
+
+  // 「测试连通」拿页面上**当前填的**值实际打一次上游 —— 填完就能试,不必先保存。
+  // 密钥框留空就回落到已存的那把(服务端按同一个约定兜底),所以想验证存着的密钥也能直接点。
+  function testAi() {
+    var body = {
+      aiEndpoint: aiEndpointEl.value.trim(),
+      aiModel: aiModelEl.value.trim(),
+    };
+    var key = aiKeyEl.value.trim();
+    if (key) body.aiKey = key;
+
+    aiTestBtn.disabled = true;
+    setStatus(aiStatusEl, '测试中…', '');
+    postJson('/api/ai/test', body)
+      .then(function (data) {
+        if (data.ok) {
+          setStatus(aiStatusEl, '连通 · ' + (data.ms / 1000).toFixed(1) + 's · ' + (data.model || ''), 'ok');
+        } else {
+          // 上游给的原话(HTTP 401 / 内容为空…),照搬给用户 —— 编一句「连接失败」等于把线索扔了。
+          setStatus(aiStatusEl, '测试失败:' + data.error, 'bad');
+        }
+      })
+      .catch(function (error) {
+        setStatus(aiStatusEl, '测试失败:' + (error.message || error), 'bad');
+      })
+      .finally(function () { aiTestBtn.disabled = false; });
+  }
+
+  aiTestBtn.addEventListener('click', testAi);
 
   // 回车即保存,和「改一行配置」的直觉一致。
   [aiEndpointEl, aiKeyEl, aiModelEl].forEach(function (input) {
@@ -811,7 +920,7 @@ export function renderDashboardHtml(options = {}) {
       .then(function () {
         setKeyHint(false, '');
         setStatus(aiStatusEl, '已清除密钥,判定将全部跳过', 'ok');
-        checkService();
+        checkProfile();
       })
       .catch(function (error) {
         setStatus(aiStatusEl, error.message || String(error), 'bad');
@@ -871,6 +980,11 @@ export function renderDashboardHtml(options = {}) {
 
   renderSamples();
   loadSettings();
+  // 首屏就把「没加载到简历」这条说清楚。光看状态灯是绿的会让人以为一切正常,
+  // 而一份简历都没有时其实一个岗位都投不出去。
+  checkProfile();
+  // 这条连接也是「服务跟随本页」的开关,见 openWatch()。
+  openWatch();
   poll();
   setInterval(poll, POLL_MS);
 </script>

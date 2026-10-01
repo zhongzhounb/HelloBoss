@@ -11,11 +11,11 @@ cd /d "%~dp0"
 
 set "KILLED="
 for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":8787" ^| findstr "LISTENING"') do (
-  echo [boss-ai-gate] 停止旧进程 PID %%p
+  echo [HelloBoss] 停止旧进程 PID %%p
   taskkill /f /pid %%p >nul 2>&1
   set "KILLED=1"
 )
-if not defined KILLED echo [boss-ai-gate] 没有在跑的旧进程。
+if not defined KILLED echo [HelloBoss] 没有在跑的旧进程。
 
 rem 端口释放需要一点时间,否则新进程可能抢不到端口。
 ping -n 2 127.0.0.1 >nul
