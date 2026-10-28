@@ -2,7 +2,7 @@
 // 而这个页面要在无外网的本地环境里也能正常打开。
 export function renderDashboardHtml(options = {}) {
   const pollMs = Number(options.pollMs) > 0 ? Math.floor(Number(options.pollMs)) : 1500;
-  const maxRows = Number(options.maxRows) > 0 ? Math.floor(Number(options.maxRows)) : 500;
+  const maxRows = Number(options.maxRows) > 0 ? Math.floor(Number(options.maxRows)) : 100;
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -26,7 +26,7 @@ export function renderDashboardHtml(options = {}) {
   /* ---- 标题栏 ---- */
   .head { display: flex; flex-direction: column; gap: 8px; }
   .topbar { display: flex; align-items: center; justify-content: space-between;
-            gap: 16px; padding: 12px 16px; background: #161b22;
+            flex-wrap: wrap; gap: 16px; padding: 12px 16px; background: #161b22;
             border: 1px solid #30363d; border-radius: 8px; }
   .topbar h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .5px; }
 
@@ -48,6 +48,15 @@ export function renderDashboardHtml(options = {}) {
   /* 顶栏里那行说明:也是次要文字,但在 flex 行里要换成「把剩余空间吃掉」的左外边距,
      好让它和状态灯一起靠右,同时抵掉 .hint 自带的下外边距(否则会比按钮低一点点)。 */
   .topbar .hint { margin: 0 0 0 auto; }
+  /* 启停失败的报错可能很长,别让它把顶栏撑开。 */
+  #ctrlStatus { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 手机看大屏的地址条:令牌很长,必须允许断行,否则会把页面撑出横向滚动。 */
+  .lan-info { display: none; padding: 9px 16px; border-radius: 8px;
+              background: #0d1b2a; border: 1px solid #1f6feb66; color: #8b949e;
+              font-size: 11px; line-height: 1.7; word-break: break-all; }
+  .lan-info.show { display: block; }
+  .lan-info a { color: #58a6ff; }
 
   /* ---- 上半:四个面板等宽 ---- */
   .top { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -75,21 +84,6 @@ export function renderDashboardHtml(options = {}) {
   .status { font-size: 11px; color: #6e7681; }
   .status.ok { color: #3fb950; }
   .status.bad { color: #f85149; }
-
-  /* ---- 样式列表 ---- */
-  .samples { flex: 1; min-height: 0; overflow-y: auto; display: flex;
-             flex-direction: column; gap: 4px; padding-right: 2px; }
-  .sample { display: flex; align-items: center; gap: 6px; padding: 4px 6px;
-            background: #0d1117; border: 1px solid #262c33; border-radius: 6px; }
-  .sample-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-                 white-space: nowrap; font-size: 12px; }
-  .sample.editing { border-color: #1f6feb; }
-  .sample input { flex: 1; min-width: 0; background: #0d1117; color: #e6edf3;
-                  border: none; outline: none; font-family: inherit; font-size: 12px; }
-  /* 行内的删除/编辑按钮要小,不能和主操作按钮抢视觉重量。 */
-  .sample button { padding: 2px 7px; font-size: 11px; border-radius: 4px; }
-  .sample button.danger:hover { background: #6e2b28; border-color: #6e2b28; color: #ffdcd7; }
-  .empty-sm { padding: 14px 4px; font-size: 11px; color: #6e7681; }
 
   /* ---- AI 接入 ---- */
   /* 字段装在可滚动容器里:窄屏折成单列时面板高度是固定的,纯靠 flex 会把
@@ -185,16 +179,19 @@ export function renderDashboardHtml(options = {}) {
   <div class="head">
     <div class="topbar">
       <h1>HelloBoss</h1>
-      <span class="hint">服务跟着本页:最小化不影响,关掉这个标签页后服务会自动停止</span>
-      <button id="svcBtn" type="button" title="点一下立即重新检测服务状态">启动中</button>
+      <span class="hint">控制台跟着本页:最小化不影响;关掉这个标签页后控制台和正在运行的服务都会停止</span>
+      <span class="status" id="ctrlStatus"></span>
+      <button id="lanBtn" type="button" title="让同一 WiFi 下的手机打开大屏">手机看大屏</button>
+      <button id="svcBtn" type="button" title="启动或停止后台判定服务">启动服务</button>
     </div>
+    <div id="lanInfo" class="lan-info"></div>
     <div id="ruleWarn">
       还没配置投递规则,当前<strong>不会投递任何岗位</strong>。
       请在下方「打招呼判定」里写下你的规则并保存 —— 规则完全由你决定,服务端不内置任何默认规则。
     </div>
     <div id="profileWarn">
       没加载到简历,当前<strong>不会投递任何岗位</strong>。
-      把简历放进服务目录的 resumes/ 里(复制 example.txt、改成别的文件名就行,也可以用 .typ),然后重启服务 ——
+      把简历放进服务目录的 resumes/ 里(复制 example.txt、改成别的文件名就行,也可以用 .typ),然后把右上角的判定服务停掉再启动一次 ——
       判定要靠简历才能对岗位做取舍。
     </div>
   </div>
@@ -213,12 +210,12 @@ export function renderDashboardHtml(options = {}) {
 
     <section class="panel">
       <h2>打招呼样式</h2>
-      <p class="hint">配了就随机挑一条<strong>原样发出</strong>;不填才由 AI 根据简历生成</p>
-      <div class="samples" id="samples"></div>
+      <p class="hint">这里写的是<strong>对 AI 的要求</strong>,不逐字发出 —— 所以可以随便写多写细,也不会出现「同一句话连发几百遍」。留空则只按简历和 JD 写</p>
+      <textarea id="greetingPrompt" placeholder="例如：&#10;对照 JD 提到的方向，说你确实做过的那部分。&#10;结尾落到「感觉非常适合这份工作」。&#10;不要点公司名，也不要说具体技术名词。"></textarea>
       <div class="panel-foot">
-        <button id="btnAddSample" type="button">添加样式</button>
-        <button id="btnSampleGreeting" type="button">填入示例</button>
-        <span class="status" id="sampleStatus"></span>
+        <button id="btnGreetingSave" type="button">保存</button>
+        <button id="btnGreetingSample" type="button">填入示例</button>
+        <span class="status" id="greetingStatus"></span>
       </div>
     </section>
 
@@ -238,10 +235,11 @@ export function renderDashboardHtml(options = {}) {
     <section class="panel">
       <h2>AI 接入</h2>
       <p class="hint">判定与招呼语都用这里配的模型。密钥只留在本机 data/settings.json,不会随记录上报</p>
+      <p class="hint">接口格式按端点地址自动识别:以 /chat/completions 结尾走 OpenAI 格式,否则走 Anthropic Messages 格式 —— 不用另配</p>
       <div class="ai-fields">
         <div class="field">
           <label for="aiEndpoint">端点地址</label>
-          <input id="aiEndpoint" type="text" placeholder="Anthropic Messages 兼容端点">
+          <input id="aiEndpoint" type="text" placeholder="Anthropic Messages 或 OpenAI Chat Completions 兼容端点">
         </div>
         <div class="field">
           <label for="aiKey">API Key</label>
@@ -270,7 +268,7 @@ export function renderDashboardHtml(options = {}) {
       </div>
     </div>
     <div id="banner">连接中断，重试中…</div>
-    <div class="table-wrap">
+    <div class="table-wrap" id="tableWrap">
       <table>
         <thead>
           <tr>
@@ -313,10 +311,13 @@ export function renderDashboardHtml(options = {}) {
     '【黑名单】某某科技、某某网络',
   ].join('\\n');
 
-  // 「填入示例」用的招呼语模板。**这一条会被原样发出去** —— 配了样式就不经过模型
-  // (见 server 侧 pickSample)。所以它不能像规则那样加一行【只是示例】的护栏:
-  // 那个前缀会变成一句荒唐的开场白。护栏只能放在点击后的状态提示里。
-  var SAMPLE_GREETING = '硕士毕业、大厂实习过、项目对口、拿过竞赛奖,很划算的!';
+  // 「填入示例」用的招呼样式。**它是给模型的要求,不会被原样发出去** ——
+  // 所以可以像这样把两种情形都写进去,比原来那种「一句固定文案」自由得多,
+  // 也不会有「同一句话连发几百遍」的问题。
+  //
+  // 写成单行是有意的:整页住在一个模板字符串里,字符串里的换行转义会被外层先
+  // 解析一遍把字面量切断(见 AGENTS.md「大屏的内联 JS 住在外层模板字符串里」)。
+  var SAMPLE_GREETING_PROMPT = '对照 JD 里提到的方向,说你确实做过的那部分,结尾落到「感觉非常适合这份工作」。不要点公司名,也不要说具体技术名词 —— 看这句的是 HR,不是工程师。';
 
   var since = 0;
   var scope = 'current';
@@ -328,13 +329,9 @@ export function renderDashboardHtml(options = {}) {
   // 记住服务端 runId,用来识别服务重启(runId 变)或 data/ 被清空(seq 回退)。
   var seenRunId = '';
 
-  // 招呼样式列表。samples 是服务端返回的那份(唯一事实来源),本地只额外记一个
-  // 「哪一行正在编辑」,免得两边各存一份内容后互相对不上。
-  var samples = [];
-  var editingIndex = -1;   // -1 无;0..length-1 改某行;length 表示新增行
-
   var statsEl = document.getElementById('stats');
   var rowsEl = document.getElementById('rows');
+  var tableWrapEl = document.getElementById('tableWrap');
   var emptyEl = document.getElementById('empty');
   var bannerEl = document.getElementById('banner');
   var scopeBtn = document.getElementById('btnScope');
@@ -346,11 +343,14 @@ export function renderDashboardHtml(options = {}) {
   var sampleBtn = document.getElementById('btnSample');
   var ruleWarnEl = document.getElementById('ruleWarn');
   var profileWarnEl = document.getElementById('profileWarn');
-  var samplesEl = document.getElementById('samples');
-  var addSampleBtn = document.getElementById('btnAddSample');
-  var sampleGreetingBtn = document.getElementById('btnSampleGreeting');
-  var sampleStatusEl = document.getElementById('sampleStatus');
+  var greetingPromptEl = document.getElementById('greetingPrompt');
+  var greetingSaveBtn = document.getElementById('btnGreetingSave');
+  var greetingSampleBtn = document.getElementById('btnGreetingSample');
+  var greetingStatusEl = document.getElementById('greetingStatus');
   var svcBtn = document.getElementById('svcBtn');
+  var lanBtn = document.getElementById('lanBtn');
+  var lanInfoEl = document.getElementById('lanInfo');
+  var ctrlStatusEl = document.getElementById('ctrlStatus');
   var aiEndpointEl = document.getElementById('aiEndpoint');
   var aiKeyEl = document.getElementById('aiKey');
   var aiModelEl = document.getElementById('aiModel');
@@ -359,12 +359,14 @@ export function renderDashboardHtml(options = {}) {
   var aiClearBtn = document.getElementById('btnAiClear');
   var aiStatusEl = document.getElementById('aiStatus');
 
+  // 记录跨天是常态(脚本挂着跑),只有时分秒会让昨天的记录和今天的长得一样。
+  // 用本地时间显示「月/日 时:分:秒」:at 存的是 UTC 串,直接切字符串会差 8 小时。
   function clock(iso) {
     var d = new Date(iso);
     if (isNaN(d.getTime())) return '';
-    return String(d.getHours()).padStart(2, '0') + ':' +
-           String(d.getMinutes()).padStart(2, '0') + ':' +
-           String(d.getSeconds()).padStart(2, '0');
+    function pad(n) { return String(n).padStart(2, '0'); }
+    return pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + ' ' +
+           pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
   function verdictCell(v) {
@@ -402,7 +404,10 @@ export function renderDashboardHtml(options = {}) {
       ? '<span class="bad">判定投了但没发出去</span> — ' + cell(detail)
       : cell(detail);
 
-    return '<tr class="' + (isAnomaly(r) ? 'anomaly' : '') + '">' +
+    // data-at / data-seq 供插入时定位用:上报是「发了就不等」(见脚本侧 Ledger),
+    // 落盘顺序不一定等于 at 的先后,所以不能只按到达顺序往表头插。
+    return '<tr class="' + (isAnomaly(r) ? 'anomaly' : '') + '"' +
+      ' data-at="' + attr(r.at) + '" data-seq="' + cell(r.seq) + '">' +
       '<td class="num">' + cell(clock(r.at)) + '</td>' +
       '<td>' + cell(r.company) + '</td>' +
       '<td class="num">' + cell(r.companyScale) + '</td>' +
@@ -483,7 +488,7 @@ export function renderDashboardHtml(options = {}) {
 
     // 筛选倍数 = 已判定 ÷ 已投递,在窗口内先各自求和再相除。
     // 不能把每天的比值再平均 —— 投递少的那些天会被等权,把一个几乎没跑的日子算成和大日子一样重。
-    // 它衡量的是「筛选力度」而不是「效果」:每日投递有上限,倍数高只说明捞进来的岗位里
+    // 它衡量的是「筛选力度」而不是「效果」:每天投出去的数量有限,倍数高只说明捞进来的岗位里
     // 大部分被判掉了(规则严,或者搜索条件开太宽),不代表挑得准。
     // 分母为 0(窗口中一份都没投出去)时不能说 0 也不能说 Infinity,给个占位符。
     var sumSent = 0;
@@ -527,52 +532,147 @@ export function renderDashboardHtml(options = {}) {
   }
 
   // ---- 记录表 ----
+  //
+  // 表格始终按「日期+时间」从早到晚排列,并且只留最近 MAX_ROWS 条。
+  // 排序不能依赖到达顺序:/report 是发了就不等的,同一批岗位的判定先后与上报
+  // 落盘顺序可能错开;跨天重放全量时更是直接按文件顺序回来。
+  // 所以每条记录都按自己的 at 找位置插入,而不是一股脑插到表头。
 
   function trimRows() {
+    // 从早到晚排列,最旧的就在表头 —— 超过上限时从表头裁。
     while (rowsEl.children.length > MAX_ROWS) {
-      rowsEl.removeChild(rowsEl.lastChild);
+      rowsEl.removeChild(rowsEl.firstChild);
     }
+  }
+
+  // 排序键:时间戳(毫秒) + seq。at 缺失或坏掉按最旧处理(-Infinity),
+  // 它们会在超过上限时最先被裁掉。同一毫秒内的多条记录用 seq 保证稳定顺序。
+  function sortKey(at, seq) {
+    var t = Date.parse(at);
+    return { t: Number.isFinite(t) ? t : -Infinity, seq: Number(seq) || 0 };
+  }
+
+  function compareKeys(a, b) {
+    if (a.t !== b.t) return a.t < b.t ? -1 : 1;
+    if (a.seq === b.seq) return 0;
+    return a.seq < b.seq ? -1 : 1;
+  }
+
+  function insertRecord(record) {
+    var tmp = document.createElement('tbody');
+    tmp.innerHTML = rowHtml(record);
+    var row = tmp.firstChild;
+    if (!row) return;
+
+    // 从早到晚:找到第一条比自己新的记录,插在它前面;没有就接到表尾。
+    var key = sortKey(record.at, record.seq);
+    var ref = null;
+    for (var node = rowsEl.firstChild; node; node = node.nextSibling) {
+      if (node.nodeType !== 1) continue;
+      var other = sortKey(node.getAttribute('data-at'), node.getAttribute('data-seq'));
+      if (compareKeys(other, key) > 0) { ref = node; break; }
+    }
+    rowsEl.insertBefore(row, ref);
+    trimRows();
+  }
+
+  // 是否已经贴在底部。留 24px 容差:浏览器缩放、行高取整都会让 scrollTop 差一两像素,
+  // 严格相等会导致「明明在最底下却不跟随」。
+  function isAtBottom() {
+    return tableWrapEl.scrollHeight - tableWrapEl.scrollTop - tableWrapEl.clientHeight <= 24;
   }
 
   function appendRecords(records) {
     if (!records.length) return;
-    var buffer = '';
+    // 从早到晚排列,最新的一条在表尾 —— 追新增记录时自动滚到底。
+    // 但要先记下追加前的位置:用户主动往上翻看旧记录时,不能每 1.5 秒把他拽回来;
+    // 等他自己滚回底部,跟随自然恢复。
+    var follow = isAtBottom();
     for (var i = 0; i < records.length; i++) {
-      buffer += rowHtml(records[i]);
+      insertRecord(records[i]);
       if (records[i].seq > since) since = records[i].seq;
     }
-    // 新记录插到顶部 —— 追加而不是整表重绘,避免每 1.5 秒闪一次。
-    rowsEl.insertAdjacentHTML('afterbegin', buffer);
-    trimRows();
     emptyEl.style.display = rowsEl.children.length ? 'none' : 'block';
+    if (follow) tableWrapEl.scrollTop = tableWrapEl.scrollHeight;
   }
 
-  // ---- 服务状态 ----
+  // ---- 服务状态与手机看大屏 ----
 
-  // 这盏灯只有一个写入者:那条一直挂着的大屏连接(/api/watch)。
-  // 连接在 = 服务在,连接断 = 服务没了;EventSource 自己会重连,重连上就又变绿。
-  // 之所以要「只有一个写入者」:以前 1.5 秒一次的 poll() 失败也会把灯拨红,
-  // 于是 /api/records 偶发抖动就会出现「服务好好的,灯却是红的」——
-  // 多个地方各写各的,谁也说不清当前是什么状态。
-  // 这个按钮只能当状态灯和手动重连用,不能真的去启动服务:页面本身就是那个服务
-  // 吐出来的,浏览器也没有权限去拉起你电脑上的 node 进程。
+  // 大屏由常驻的控制进程提供;右上角按钮启停的是后台判定服务。
+  // 状态跟着 /api/records 的轮询一起回来,不再由 SSE 连接推断 —— 连接在只说明
+  // 控制台还活着,并不说明判定服务开着。
   var watch = null;
+  var service = { managed: false, running: true, state: 'running' };
+  var lan = { managed: false, enabled: false, urls: [] };
 
-  function setSvcState(state) {
-    svcBtn.classList.toggle('up', state === 'up');
-    svcBtn.classList.toggle('down', state === 'down');
-    svcBtn.textContent = state === 'up' ? '服务运行中'
-      : (state === 'down' ? '服务未连接' : '启动中');
+  function setCtrlStatus(message, tone) {
+    ctrlStatusEl.textContent = message || '';
+    ctrlStatusEl.className = 'status' + (tone ? ' ' + tone : '');
   }
 
-  // 挂上这条连接。服务端靠它判断「还有人在看大屏」——页面关掉这条连接就断了,
-  // 服务会在宽限期后自己退出。重连(刷新、切回来、断线重试)由 EventSource 负责。
+  function applyService(data) {
+    if (!data) return;
+    service = data;
+
+    var managed = data.managed !== false;
+    var busy = data.state === 'starting' || data.state === 'stopping';
+    svcBtn.classList.toggle('up', data.running === true);
+    svcBtn.classList.toggle('down', managed && data.running !== true && !busy);
+
+    if (!managed) {
+      svcBtn.disabled = true;
+      svcBtn.textContent = '服务运行中';
+      svcBtn.title = '当前是命令行启动,判定服务不由大屏管理';
+      return;
+    }
+
+    svcBtn.disabled = false;
+    if (data.state === 'starting') {
+      svcBtn.textContent = '启动中…';
+      svcBtn.title = '正在启动判定服务';
+    } else if (data.state === 'stopping') {
+      svcBtn.textContent = '停止中…';
+      svcBtn.title = '正在停止判定服务';
+    } else if (data.running) {
+      svcBtn.textContent = '停止服务';
+      svcBtn.title = '点击停止后台判定服务';
+    } else {
+      svcBtn.textContent = '启动服务';
+      svcBtn.title = '点击启动后台判定服务';
+    }
+  }
+
+  function applyLan(data) {
+    if (!data) return;
+    lan = data;
+
+    var managed = data.managed !== false;
+    lanBtn.disabled = !managed;
+    lanBtn.textContent = managed && data.enabled ? '关闭手机访问' : '手机看大屏';
+    lanBtn.title = !managed
+      ? '当前是命令行启动,局域网开关不由大屏管理'
+      : (data.enabled ? '关闭局域网访问' : '让同一 WiFi 下的手机打开大屏');
+
+    var urls = data.urls || [];
+    if (managed && data.enabled) {
+      lanInfoEl.classList.add('show');
+      lanInfoEl.innerHTML = urls.length
+        ? '手机与电脑连同一个 WiFi,打开下面的地址(令牌已带在链接里,打开一次之后就会记住):<br>'
+          + urls.map(function (url) {
+            return '<a href="' + attr(url) + '">' + cell(url) + '</a>';
+          }).join('<br>')
+        : '已开启局域网访问,但没找到可用的局域网 IPv4 地址。';
+    } else {
+      lanInfoEl.classList.remove('show');
+      lanInfoEl.textContent = '';
+    }
+  }
+
+  // 挂上这条连接。控制进程靠它判断「还有人在看大屏」——页面关掉这条连接就断了,
+  // 控制进程会在宽限期后退出。重连(刷新、切回来、断线重试)由 EventSource 负责。
   function openWatch() {
     if (watch) watch.close();
     watch = new EventSource('/api/watch');
-    watch.addEventListener('open', function () { setSvcState('up'); });
-    // 这里不区分「服务没了」和「网络抖了一下」:连不上就是连不上,重连成功自然会回到绿色。
-    watch.addEventListener('error', function () { setSvcState('down'); });
   }
 
   // 只为「没加载到简历」那条警告条去查 /health:一份简历都没有 = 一个岗位都投不出去,
@@ -588,10 +688,51 @@ export function renderDashboardHtml(options = {}) {
       .catch(function () {});
   }
 
+  function refreshLan() {
+    fetch('/api/lan')
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) { if (data) applyLan(data); })
+      .catch(function () {});
+  }
+
   svcBtn.addEventListener('click', function () {
-    setSvcState('starting');
-    openWatch();
-    checkProfile();
+    if (!service || service.managed === false) return;
+
+    var action = service.running ? 'stop' : 'start';
+    svcBtn.disabled = true;
+    svcBtn.textContent = action === 'start' ? '启动中…' : '停止中…';
+    setCtrlStatus('', '');
+
+    postJson('/api/service/' + action, {})
+      .then(function (data) {
+        applyService(data);
+        // 服务刚启动时简历才算真正加载,顺手刷新一下警告条。
+        if (action === 'start') checkProfile();
+      })
+      .catch(function (error) {
+        setCtrlStatus(error.message || String(error), 'bad');
+        applyService(service);
+      });
+  });
+
+  lanBtn.addEventListener('click', function () {
+    if (!lan || lan.managed === false) return;
+
+    var next = !lan.enabled;
+    lanBtn.disabled = true;
+    setCtrlStatus(next ? '正在开启手机访问…' : '正在关闭手机访问…', '');
+
+    postJson('/api/lan', { enabled: next })
+      .then(function (data) {
+        applyLan(data);
+        setCtrlStatus(next
+          ? '已开启:手机与电脑连同一个 WiFi 即可打开上面的地址'
+          : '已关闭手机访问', 'ok');
+      })
+      .catch(function (error) {
+        setCtrlStatus(error.message || String(error), 'bad');
+        applyLan(lan);
+      });
   });
 
   function poll() {
@@ -621,6 +762,7 @@ export function renderDashboardHtml(options = {}) {
         }
 
         stats = data.stats;
+        applyService(data.service);
         daily = data.daily || [];
         appendRecords(data.records || []);
         renderStats();
@@ -628,7 +770,7 @@ export function renderDashboardHtml(options = {}) {
       })
       .catch(function () {
         // 服务可能刚重启或短暂不可达 —— 提示但不停止重试,页面也不清空。
-        // 状态灯不在这里改:它的唯一依据是那条大屏连接,见 openWatch()。
+        // 按钮状态不在这里改:它跟着 /api/records 里的 service 字段走。
         bannerEl.classList.add('show');
       })
       .finally(function () { inflight = false; });
@@ -715,132 +857,48 @@ export function renderDashboardHtml(options = {}) {
     setStatus(promptStatusEl, '已填入示例,按你的情况改完再点保存', '');
   });
 
-  // ---- 打招呼样式(列表,增删改立即落盘) ----
+  // ---- 打招呼样式(prompt,不逐字发出) ----
 
-  function renderSamples() {
-    var html = '';
-
-    for (var i = 0; i < samples.length; i++) {
-      if (i === editingIndex) {
-        html += '<div class="sample editing">' +
-          '<input id="sampleInput" value="' + attr(samples[i]) + '">' +
-          '<button type="button" data-act="commit" data-i="' + i + '">确定</button>' +
-          '<button type="button" data-act="cancel">取消</button>' +
-          '</div>';
-      } else {
-        html += '<div class="sample">' +
-          '<span class="sample-text" title="' + attr(samples[i]) + '">' + cell(samples[i]) + '</span>' +
-          '<button type="button" data-act="edit" data-i="' + i + '">编辑</button>' +
-          '<button type="button" class="danger" data-act="del" data-i="' + i + '">删除</button>' +
-          '</div>';
-      }
-    }
-
-    // 新增行挂在列表末尾,与「添加样式」按钮的位置一致。
-    if (editingIndex === samples.length) {
-      html += '<div class="sample editing">' +
-        '<input id="sampleInput" placeholder="例如:硕士毕业，大厂实习">' +
-        '<button type="button" data-act="commit" data-i="' + samples.length + '">添加</button>' +
-        '<button type="button" data-act="cancel">取消</button>' +
-        '</div>';
-    }
-
-    if (!html) {
-      samplesEl.innerHTML = '<div class="empty-sm">还没有样式。不填的话招呼语按原来的方式自由生成。</div>';
-    } else {
-      samplesEl.innerHTML = html;
-    }
-
-    // 进入编辑态就聚焦,省一次点击。放在 innerHTML 之后才拿得到元素。
-    var input = document.getElementById('sampleInput');
-    if (input) input.focus();
+  // 这一段是**给模型的要求**,不是要发出去的文本 —— 所以可以写多写细,
+  // 不用担心被原样发出去,也不用担心「同一句话连发几百遍」。
+  function applyGreetingPrompt(data) {
+    greetingPromptEl.value = (data && data.greetingPrompt) || '';
   }
 
-  function persistSamples(next, successText) {
-    setStatus(sampleStatusEl, '保存中…', '');
-    return postSettings({ greetingSamples: next })
+  function saveGreetingPrompt() {
+    greetingSaveBtn.disabled = true;
+    setStatus(greetingStatusEl, '保存中…', '');
+    postSettings({ greetingPrompt: greetingPromptEl.value })
       .then(function (data) {
-        // 以服务端清洗后的结果为准 —— 它会 trim、丢空行,本地照抄一份迟早会不一致。
-        samples = (data.settings && data.settings.greetingSamples) || [];
-        editingIndex = -1;
-        // 普通保存显示「已保存」;载入示例复用同一条落盘路径时,换成提醒用户去改的那句 ——
-        // 招呼语是原样发出去的,这句提示是唯一的护栏。
-        setStatus(sampleStatusEl, successText || '已保存', 'ok');
-        renderSamples();
+        applyGreetingPrompt(data.settings || {});
+        setStatus(greetingStatusEl, '已保存，下一个岗位立即生效', 'ok');
       })
       .catch(function (error) {
-        setStatus(sampleStatusEl, '保存失败:' + (error.message || error), 'bad');
-        renderSamples();
-      });
+        // 服务端的报错很具体(超了多少字)，原样显示才有用。
+        setStatus(greetingStatusEl, error.message || String(error), 'bad');
+      })
+      .finally(function () { greetingSaveBtn.disabled = false; });
   }
 
-  // 事件委托:列表每次重绘都会换掉所有按钮,逐个绑监听会随重绘次数泄漏。
-  samplesEl.addEventListener('click', function (event) {
-    var button = event.target.closest('button[data-act]');
-    if (!button) return;
-    var act = button.dataset.act;
-    var index = Number(button.dataset.i);
+  greetingSaveBtn.addEventListener('click', saveGreetingPrompt);
 
-    if (act === 'edit') {
-      editingIndex = index;
-      setStatus(sampleStatusEl, '', '');
-      renderSamples();
+  greetingSampleBtn.addEventListener('click', function () {
+    if (greetingPromptEl.value.trim()) {
+      // 和规则面板同一条规矩:示例只给空框起步,不覆盖已经调好的内容。
+      setStatus(greetingStatusEl, '文本框已有内容，没有覆盖', '');
       return;
     }
-
-    if (act === 'cancel') {
-      editingIndex = -1;
-      setStatus(sampleStatusEl, '', '');
-      renderSamples();
-      return;
-    }
-
-    if (act === 'del') {
-      var kept = [];
-      for (var i = 0; i < samples.length; i++) if (i !== index) kept.push(samples[i]);
-      persistSamples(kept);
-      return;
-    }
-
-    if (act === 'commit') {
-      var input = document.getElementById('sampleInput');
-      var value = input ? input.value.trim() : '';
-      if (!value) {
-        setStatus(sampleStatusEl, '样式不能为空', 'bad');
-        return;
-      }
-      var next = samples.slice();
-      if (index >= next.length) next.push(value);
-      else next[index] = value;
-      persistSamples(next);
-    }
-  });
-
-  // 编辑行里按回车直接提交,符合"改一行小文本"的直觉。
-  samplesEl.addEventListener('keydown', function (event) {
-    if (event.key !== 'Enter') return;
-    if (!event.target.closest('.sample.editing')) return;
-    var button = samplesEl.querySelector('button[data-act="commit"]');
-    if (button) button.click();
-  });
-
-  addSampleBtn.addEventListener('click', function () {
-    editingIndex = samples.length;
-    setStatus(sampleStatusEl, '', '');
-    renderSamples();
-  });
-
-  sampleGreetingBtn.addEventListener('click', function () {
-    if (samples.length) {
-      // 和规则面板同一条规矩:示例只给空列表起步,不覆盖已经调好的样式。
-      // 这条不能省 —— samples 是原样发出去的,覆盖等于把用户在用的招呼语悄悄换掉。
-      setStatus(sampleStatusEl, '已有样式,没有覆盖', '');
-      return;
-    }
-    persistSamples([SAMPLE_GREETING], '已填入示例,按你的情况改完再保存');
+    greetingPromptEl.value = SAMPLE_GREETING_PROMPT;
+    setStatus(greetingStatusEl, '已填入示例，按你的情况改完再点保存', '');
   });
 
   // ---- AI 接入 ----
+
+  // 服务端 detectApiFormat 的两个返回值 → 给人看的名字。
+  var FORMAT_NAMES = {
+    anthropic: 'Anthropic Messages',
+    openai: 'OpenAI chat/completions',
+  };
 
   // 密钥框永远不回填明文(服务端也根本不回传),所以「已配置 / 未配置」只能靠提示文字
   // 表达 —— 否则用户看到空框会以为没存上,又把密钥粘一遍。
@@ -891,11 +949,15 @@ export function renderDashboardHtml(options = {}) {
     setStatus(aiStatusEl, '测试中…', '');
     postJson('/api/ai/test', body)
       .then(function (data) {
+        // 格式是按端点地址自动识别的,服务端把判成了哪一种回过来。填了个看不出格式的
+        // 中转时,这是唯一能确认「它到底按哪种打的」的地方 —— 所以成功失败都要显示。
+        var format = FORMAT_NAMES[data.format] || data.format || '';
         if (data.ok) {
-          setStatus(aiStatusEl, '连通 · ' + (data.ms / 1000).toFixed(1) + 's · ' + (data.model || ''), 'ok');
+          setStatus(aiStatusEl, '连通 · ' + (data.ms / 1000).toFixed(1) + 's · ' + (data.model || '')
+            + (format ? ' · ' + format + '格式' : ''), 'ok');
         } else {
           // 上游给的原话(HTTP 401 / 内容为空…),照搬给用户 —— 编一句「连接失败」等于把线索扔了。
-          setStatus(aiStatusEl, '测试失败:' + data.error, 'bad');
+          setStatus(aiStatusEl, '测试失败:' + data.error + (format ? '(按 ' + format + ' 格式请求)' : ''), 'bad');
         }
       })
       .catch(function (error) {
@@ -943,8 +1005,7 @@ export function renderDashboardHtml(options = {}) {
         // 已经有规则就锁住(那才是「已保存」的状态);还没有就直接开放编辑 ——
         // 一个空框还锁着,只会让第一次用的人以为这个功能坏了。
         setPromptMode(savedRule.trim() ? 'locked' : 'editing');
-        samples = data.greetingSamples || [];
-        renderSamples();
+        applyGreetingPrompt(data);
         aiEndpointEl.value = data.aiEndpoint || '';
         aiModelEl.value = data.aiModel || '';
         // 密钥不回填 —— 服务端不回传明文,这里只用末四位提示「已配置 / 未配置」。
@@ -954,7 +1015,6 @@ export function renderDashboardHtml(options = {}) {
         // 读不到就别锁 —— 锁住的话这个框彻底没法用,而用户可能正是来改它的。
         setPromptMode('editing');
         setStatus(promptStatusEl, '配置读取失败:' + (error.message || error), 'bad');
-        samplesEl.innerHTML = '<div class="empty-sm">配置读取失败</div>';
       });
   }
 
@@ -978,12 +1038,12 @@ export function renderDashboardHtml(options = {}) {
     location.href = '/api/export.csv';
   });
 
-  renderSamples();
   loadSettings();
   // 首屏就把「没加载到简历」这条说清楚。光看状态灯是绿的会让人以为一切正常,
   // 而一份简历都没有时其实一个岗位都投不出去。
   checkProfile();
-  // 这条连接也是「服务跟随本页」的开关,见 openWatch()。
+  refreshLan();
+  // 这条连接也是「控制台跟随本页」的开关,见 openWatch()。
   openWatch();
   poll();
   setInterval(poll, POLL_MS);

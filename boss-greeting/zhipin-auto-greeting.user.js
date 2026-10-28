@@ -19,7 +19,7 @@
  * - 面板在岗位列表页 `/web/geek/jobs` 的全部子路由和聊天页 `/web/geek/chat` 显示。
  * - 主流程：岗位列表选择岗位 -> 点击沟通按钮 -> 进入聊天页 -> 发送常用语或自定义文本 -> 返回岗位列表继续。
  * - 支持随机时间间隔、聊天/列表等待上限、已沟通跳过、岗位沟通记录导出与清理。
- * - 列表耗尽后可自动刷新页面续跑；沟通次数提醒弹窗会自动点击确定，硬限制则暂停。
+ * - 列表耗尽后可自动刷新页面续跑；平台的沟通次数提醒（软提醒/硬限制）会让整轮暂停。
  * - 岗位记录存储在浏览器 IndexedDB，运行状态存储在 localStorage，用于跨页面跳转后恢复自动化。
  *
  * 维护定位：
@@ -115,11 +115,16 @@
     // 当前列表扫完后是否整页刷新续跑；刷新次数上限 0 表示不限制。
     autoRefreshOnExhausted: true,
     maxListRefresh: 5,
-    delayMin: 4,
-    delayMax: 8,
+    // 平台的「还剩 N 次沟通」软提醒要不要当成停机信号。默认停 —— 它是动真格之前
+    // 的最后一次预警，点掉继续跑等于告诉风控「警告之后行为毫无变化」。
+    stopOnSoftReminder: true,
+    delayMin: 30,
+    delayMax: 90,
     waitTimeout: 5,
     chatOpenRetries: 2,
-    maxCount: 0,
+    // 单轮最大沟通数。默认 40 而不是 0(不限制):投多少个完全由这一项控制,
+    // 服务端不再另设每日上限。老配置里显式写着的 0 不动,那是用户自己的选择。
+    maxCount: 40,
     // 公司过滤和数据维护选项。
     companyFilterMode: 'partial',
     companyFilterValue: '',
@@ -134,6 +139,10 @@
   const CONFIG_FIELD_KEYS = Object.keys(DEFAULT_CONFIG);
   const CONFIG_FIELD_KEY_SET = new Set(CONFIG_FIELD_KEYS);
   const STRUCTURED_CONFIG_FIELD_KEYS = new Set(['customApiParams', 'customApiHeaders']);
+
+  // 旧版本的默认间隔（秒）。只用来识别「这一项从来没被人改过」的配置，见 normalizeConfig。
+  const LEGACY_DELAY_MIN = 4;
+  const LEGACY_DELAY_MAX = 8;
 
   // 页面级运行时缓存，只在当前页面生命周期内有效；跨页面恢复依赖 RunState(localStorage)。
   const runtime = {
@@ -250,6 +259,16 @@
       .filter((item) => availableKeys.has(normalizeBossActiveText(item)));
     next.featurePanelOpen = Boolean(next.featurePanelOpen);
     next.featureBlocks = normalizeFeatureBlocks(next.featureBlocks);
+
+    // 间隔的一次性迁移：4/8 秒是旧版本的默认值，照它跑就是每分钟一个岗位、连跑
+    // 一整天 —— 那正是账号被判成机器人的节奏。
+    //
+    // 只动**恰好还是旧默认值**的配置：说明这一项从来没被人改过。用户自己调过的
+    // 数值（哪怕是 5/10）一概不碰，所以不会跟人的意图打架。
+    if (Number(next.delayMin) === LEGACY_DELAY_MIN && Number(next.delayMax) === LEGACY_DELAY_MAX) {
+      next.delayMin = DEFAULT_CONFIG.delayMin;
+      next.delayMax = DEFAULT_CONFIG.delayMax;
+    }
 
     return next;
   }
@@ -459,7 +478,6 @@
           return result;
         };
 
-        maskNative(wrapped, raw);
         history[method] = wrapped;
       });
 
@@ -605,10 +623,6 @@
         pauseReason: reason || '已暂停',
       });
       return state;
-    },
-    // 清掉跨页面状态，通常用于用户手动结束或重新开始前。
-    clear() {
-      localStorage.removeItem(APP.runKey);
     },
   };
 
@@ -828,7 +842,8 @@
         return result;
       };
 
-      maskNative(wrappedFetch, rawFetch);
+      // 这里原先会把 wrappedFetch 的 toString 伪装成原生实现。已经去掉，理由见
+      // 「为什么不再伪装 toString」那段注释。
       wrappedFetch.__zhipinAutoGreetingPatched = true;
       pageWindow.fetch = wrappedFetch;
     }
@@ -845,7 +860,6 @@
         this.__zhipinAutoGreetingHeaders = {};
         return rawOpen.apply(this, arguments);
       };
-      maskNative(XHR.prototype.open, rawOpen);
 
       if (typeof rawSetRequestHeader === 'function') {
         XHR.prototype.setRequestHeader = function setRequestHeader(name, value) {
@@ -858,7 +872,6 @@
           } catch (_) {}
           return rawSetRequestHeader.apply(this, arguments);
         };
-        maskNative(XHR.prototype.setRequestHeader, rawSetRequestHeader);
       }
 
       XHR.prototype.send = function send() {
@@ -884,7 +897,6 @@
 
         return rawSend.apply(this, arguments);
       };
-      maskNative(XHR.prototype.send, rawSend);
       XHR.prototype.__zhipinAutoGreetingPatched = true;
     }
   }
@@ -1097,17 +1109,23 @@
     return init;
   }
 
-  // 保持包装函数的 toString 接近原始实现，降低页面检测 monkey patch 的概率。
-  function maskNative(wrapper, original) {
-    try {
-      Object.defineProperty(wrapper, 'toString', {
-        configurable: true,
-        value() {
-          return Function.prototype.toString.call(original);
-        },
-      });
-    } catch (_) {}
-  }
+  // 为什么不再伪装 toString
+  //
+  // 这里原先有个 maskNative()，把包装过的 fetch / XHR / history 方法的 toString
+  // 伪造成原生实现，好让页面「看起来检测不出 monkey patch」。
+  //
+  // 已经整套删掉。理由不是它没用，而是它的收益是负的：
+  //
+  // 1. 它是**最经典的检测点**。改写 Function.prototype.toString 这件事本身，
+  //    比被包装的那几个方法更容易被认出来 —— 页面只要拿一个已知原生函数走一遍
+  //    就能发现全局 toString 被换过。伪装得越像，被识破时的定性越重。
+  // 2. 概率上也不划算。页面若真在查 monkey patch，识别出伪装只是时间问题；
+  //    而一旦被认出来，性质就从「疑似自动化」变成「确认在对抗风控」。
+  // 3. 何况账号会不会被处置，取决于发了多少、发了什么、以及平台警告之后有没有
+  //    收敛 —— 跟 toString 像不像原生没有关系。真想降低风险，该改的是节奏和
+  //    文案重复度，不是这一层化妆。
+  //
+  // 保留这段注释是为了别有人再把它加回来。
 
   // 保存 History 原型方法，返回列表时优先调用原生实现，减少被页面覆写影响。
   function captureNativeHistoryNavigation() {
@@ -1640,11 +1658,6 @@
       if (looseDetail && isWeakDetailCompatible(job, looseDetail)) return looseDetail;
 
       return null;
-    },
-
-    // 判断是否需要主动补拉详情接口，避免复用缺薪资/缺 rawDetail 的半成品详情。
-    shouldFetchJobDetail(job, detail, options) {
-      return getJobDetailFetchDecision(job, detail, options).shouldFetch;
     },
 
     // 点击岗位卡片后等待详情接口/HTML 数据到达；超时则主动补抓接口。
@@ -2682,6 +2695,7 @@
             <label class="za-check"><input data-field="collectGreetedJobs" type="checkbox"> 收集已打招呼岗位信息</label>
             <label class="za-check"><input data-field="ignoreListRefresh" type="checkbox"> 无视列表刷新</label>
             <label class="za-check"><input data-field="autoRefreshOnExhausted" type="checkbox"> 列表耗尽后自动刷新</label>
+            <label class="za-check"><input data-field="stopOnSoftReminder" type="checkbox" title="平台提示「还剩 N 次沟通」时停下这一轮，而不是点掉弹窗继续发。关掉它大概率会换来更重的处置"> 收到平台提醒就停下</label>
             <div class="za-grid-2">
               <label>最小间隔(秒)<input data-field="delayMin" type="number" min="1" step="1"></label>
               <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
@@ -4040,7 +4054,15 @@
         });
 
         if (response.status < 200 || response.status >= 300) {
-          throw new Error(`判定服务返回 HTTP ${response.status}`);
+          // 服务端会把原因写在 error 里(比如「判定服务未启动」),原样透出去比
+          // 只报一个 HTTP 503 有用得多 —— 用户才知道去大屏点「启动服务」。
+          let detail = '';
+          try {
+            detail = JSON.parse(response.responseText || '{}').error || '';
+          } catch {
+            // 不是 JSON 就退回状态码
+          }
+          throw new Error(detail || `判定服务返回 HTTP ${response.status}`);
         }
 
         const data = JSON.parse(response.responseText || '{}');
@@ -4735,6 +4757,7 @@
         }
 
         const verdict = await AiGate.evaluate(job, scanKey);
+
         if (!verdict.apply) {
           // 把 verdict.reason 拼进来,而不是写死一句「AI 判定不投」。
           // UI.setStatus 是同步写 textContent、后写覆盖先写,所以覆盖在 AiGate 内部
@@ -4850,7 +4873,7 @@
     watchChatPageTransition(job) {
       waitFor(() => {
         const dialog = inspectBossPlatformDialog({ dismissSoft: true });
-        if (dialog && dialog.kind === 'hard_limit') {
+        if (isPauseDialog(dialog)) {
           throw createPauseError(formatBossDialogPauseMessage(dialog));
         }
         return isChatPage() ? 'same-page' : null;
@@ -4900,7 +4923,7 @@
           },
         }, 'warn');
 
-        if (dialog && dialog.kind === 'hard_limit') {
+        if (isPauseDialog(dialog)) {
           runtime.automationLoopActive = false;
           this.pause(formatBossDialogPauseMessage(dialog));
           return;
@@ -4964,7 +4987,7 @@
 
         // 进入聊天发送前先消掉可能残留的沟通提醒弹窗，避免输入框等待被挡住。
         const dialog = inspectBossPlatformDialog({ dismissSoft: true });
-        if (dialog && dialog.kind === 'hard_limit') {
+        if (isPauseDialog(dialog)) {
           throw createPauseError(formatBossDialogPauseMessage(dialog));
         }
 
@@ -5049,9 +5072,9 @@
           }, 'warn');
 
           if (!isChatRenderTimeoutError(error) || attempts >= maxRetries) {
-            // 最后一次聊天超时时再尝试关闭软提醒；硬限制转暂停而不是 fatal。
+            // 最后一次聊天超时时再确认一次弹窗；额度预警和硬限制都转成暂停而不是 fatal。
             const dialog = inspectBossPlatformDialog({ dismissSoft: true });
-            if (dialog && dialog.kind === 'hard_limit') {
+            if (isPauseDialog(dialog)) {
               throw createPauseError(formatBossDialogPauseMessage(dialog));
             }
             throw error;
@@ -6827,58 +6850,6 @@
     return Boolean(element && element.closest && element.closest('#zhipin-auto-greeting-root'));
   }
 
-  // 判断聊天页左侧会话列表是否渲染完成。
-  function hasConversationList() {
-    return Array.from(document.querySelectorAll('.user-list-content li, .user-list li, .chat-user li'))
-      .some((element) => isVisible(element) && normalizeText(element.innerText || element.textContent || '').length > 4);
-  }
-
-  // 在聊天页左侧会话列表中确认当前会话是否对应 pendingJob。
-  function findSelectedConversationForJob(job) {
-    if (!job) return null;
-
-    const bossName = normalizeText(job.bossName);
-    const company = normalizeText(job.company);
-    const jobName = normalizeText(job.jobName);
-    const selectors = [
-      '.user-list-content li.selected',
-      '.user-list-content li.active',
-      '.user-list-content li.cur',
-      '.user-list li.selected',
-      '.user-list li.active',
-      '.user-list li.cur',
-      '.chat-user li.selected',
-      '.chat-user li.active',
-      '.chat-user li.cur',
-      '.friend-content.selected',
-      '.friend-content.active',
-      '.friend-content.cur',
-      '.friend-content-warp.selected',
-      '.friend-content-warp.active',
-      '.friend-content-warp.cur',
-    ];
-    const candidates = Array.from(document.querySelectorAll(selectors.join(','))).filter(isVisible);
-    let best = null;
-
-    for (const element of candidates) {
-      const text = normalizeText(element.innerText || element.textContent || '');
-      if (!text || text.length < 2) continue;
-
-      let score = 0;
-      if (bossName && text.includes(bossName)) score += 4;
-      if (company && text.includes(company)) score += 4;
-      if (jobName && text.includes(jobName)) score += 2;
-      if (/正在与Boss|沟通/.test(text)) score += 1;
-
-      if (!best || score > best.score) {
-        best = { element, score, text };
-      }
-    }
-
-    if (!best || best.score < 4) return null;
-    return best;
-  }
-
   // 构造“需要人工处理”的暂停错误，区别于真正脚本异常。
   function createPauseError(message) {
     const error = new Error(message);
@@ -6917,10 +6888,15 @@
       const text = normalizeText(root.innerText || root.textContent || '');
       if (!text || text.length < 6 || text.length > 500) continue;
 
-      const softReminder = /温馨提示/.test(text) && /沟通/.test(text)
-        || /还剩\s*\d+\s*次沟通/.test(text)
+      // 额度预警:带**数字**的说法(「还剩 N 次沟通」「您今天已与 N 位」)。
+      // 只有这一类才构成停机信号 —— 见 isPauseDialog 里的理由。
+      const quotaWarning = /还剩\s*\d+\s*次沟通/.test(text)
         || /您今天已与\s*\d+\s*位/.test(text)
         || /沟通机会/.test(text) && /今天已与|还剩/.test(text);
+      // 更宽的「这是个沟通相关的提示」判定,给「点掉它继续」那条老路径用。
+      // 单独一个「温馨提示 + 沟通」可能只是一句普通告知(比如提醒别透露隐私),
+      // 拿它停掉整轮属于误伤,所以它算 softReminder 但不算 quotaWarning。
+      const softReminder = quotaWarning || /温馨提示/.test(text) && /沟通/.test(text);
       const hardLimit = /今日沟通(?:次数)?已(?:用完|达上限)|沟通次数(?:已)?(?:用完|达上限)|无法继续沟通|今日无法再沟通|已达(?:到)?沟通上限/.test(text);
       // BOSS 首次「立即沟通」会就地代发一条自带招呼语，并弹出「已向BOSS发送消息」窗，
       // 只有「继续沟通」才会进入聊天页；脚本必须识别它，否则会一直等不到聊天页。
@@ -6952,6 +6928,8 @@
           root,
           text,
           kind: hardLimit ? 'hard_limit' : greetingSent ? 'greeting_sent' : 'soft_reminder',
+          // 带数字的额度预警才算停机信号 —— kind 是 soft_reminder 时不代表它一定够格。
+          quotaWarning,
           // 字段名沿用 confirmButton：greeting_sent 时它承载的是「继续沟通」按钮。
           confirmButton: action,
           score,
@@ -6969,24 +6947,51 @@
     return short ? `沟通受限，已暂停：${short}` : '沟通次数已达上限，已暂停';
   }
 
-  // 检查并处理平台弹窗：软提醒可点击确定；硬限制只返回结果，由调用方 pause；
+  // 这个弹窗要不要让整轮停下来。
+  //
+  // 硬限制(今日沟通次数已用完)必须停 —— 平台已经不给发了,继续点只会一直失败。
+  // 软提醒里的**额度预警**(「还剩 N 次沟通」)同样默认停:那是平台动真格之前最后
+  // 一次预警,把它当障碍物点掉继续跑,等于告诉风控「警告之后行为毫无变化」,
+  // 而代价只是今天少投几个岗位 —— 漏投的明天还能补,封掉的号补不回来。
+  //
+  // 但只有带数字的额度预警才够格:宽松判定出来的「温馨提示 + 沟通」可能只是一句
+  // 普通告知(提醒别透露隐私之类)。拿它停掉整轮属于误伤,而误伤几次之后用户就会
+  // 把这个保护关掉 —— 那才是真正的损失。
+  function isPauseDialog(dialog) {
+    if (!dialog) return false;
+    if (dialog.kind === 'hard_limit') return true;
+    return dialog.kind === 'soft_reminder'
+      && dialog.quotaWarning
+      && config.stopOnSoftReminder !== false;
+  }
+
+  // 检查并处理平台弹窗：需要停机的(硬限制、以及默认开启的软提醒)只返回结果，
+  // 由调用方 pause；关闭 stopOnSoftReminder 后软提醒退回「点确定继续」；
   // 代发招呼语弹窗点击「继续沟通」进入聊天页，让脚本自己再发一条。
   function inspectBossPlatformDialog(options) {
     const settings = options || {};
     const dialog = findBossPlatformDialog();
     if (!dialog) return null;
 
-    if (dialog.kind === 'soft_reminder' && settings.dismissSoft && dialog.confirmButton) {
-      const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
-      if (Date.now() - lastAt > 900) {
-        UI.setStatus('检测到沟通提醒弹窗，正在点击确定...', 'warn');
-        logDebugEvent('boss_platform_dialog_dismiss', {
-          kind: dialog.kind,
+    if (dialog.kind === 'soft_reminder') {
+      if (isPauseDialog(dialog)) {
+        // 停机模式下**不点掉它**：点掉会让「停一天」变成「继续跑」，用户也再看不到
+        // 这条提醒的原文。原文已经进了调试事件，大屏和日志里都查得到。
+        logDebugEvent('boss_platform_dialog_soft_stop', {
           text: summarizeLongText(dialog.text),
-          buttonText: normalizeText(dialog.confirmButton.innerText || dialog.confirmButton.textContent || ''),
-        });
-        clickElement(dialog.confirmButton);
-        runtime.lastBossDialogDismissAt = Date.now();
+        }, 'warn');
+      } else if (settings.dismissSoft && dialog.confirmButton) {
+        const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
+        if (Date.now() - lastAt > 900) {
+          UI.setStatus('检测到沟通提醒弹窗，正在点击确定...', 'warn');
+          logDebugEvent('boss_platform_dialog_dismiss', {
+            kind: dialog.kind,
+            text: summarizeLongText(dialog.text),
+            buttonText: normalizeText(dialog.confirmButton.innerText || dialog.confirmButton.textContent || ''),
+          });
+          clickElement(dialog.confirmButton);
+          runtime.lastBossDialogDismissAt = Date.now();
+        }
       }
     } else if (dialog.kind === 'hard_limit') {
       logDebugEvent('boss_platform_dialog_hard_limit', {
@@ -7036,7 +7041,7 @@
     });
     return waitFor(() => {
       const dialog = inspectBossPlatformDialog({ dismissSoft: true });
-      if (dialog && dialog.kind === 'hard_limit') {
+      if (isPauseDialog(dialog)) {
         throw createPauseError(formatBossDialogPauseMessage(dialog));
       }
 
@@ -8841,11 +8846,6 @@
       jobSalary,
       detailSalary,
     };
-  }
-
-  // 主动补拉详情后的安全校验：优先要求可靠 ID 命中，必要时才退回文本兼容判断。
-  function isFetchedDetailCompatibleWithJob(job, detail, options) {
-    return getFetchedDetailCompatibilityReport(job, detail, options).compatible;
   }
 
   function getFetchedDetailCompatibilityReport(job, detail, options) {

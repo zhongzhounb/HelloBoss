@@ -1,18 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-// 大屏上可以直接改的配置(判定规则、招呼样例、AI 接入)。
+// 大屏上可以直接改的配置(判定规则、招呼样式、AI 接入)。
 //
 // 为什么不放进 config/preferences.json:那些文件是**启动时**读一次、且是用户手改的静态配置,
 // 而这几项要在大屏上随时改、即时生效,并且是运行时数据。放 data/ 下还有个好处 ——
-// 它已经在 .gitignore 里,个人招呼样例与 API 密钥不会被提交进仓库。
+// 它已经在 .gitignore 里,个人招呼样式与 API 密钥不会被提交进仓库。
 //
 // 与 loadServerConfig 的错误处理**刻意相反**:服务配置(lan/token)坏掉必须拒绝启动(fail-closed),
-// 因为那关系到把记录暴露给整个局域网;而这里只是个可空开关,坏掉时退回「没有规则、没有样例」
+// 因为那关系到把记录暴露给整个局域网;而这里只是个可空开关,坏掉时退回「没有规则、没有样式要求」
 // —— 那恰好等于改造前的行为,服务照常跑,不该因为一个可选功能起不来。
 
 // AI 接入的默认值。默认指向 Anthropic 官方端点、且**密钥留空**。
-// 空密钥 = 尚未接入,判定一律走 fallback(见 evaluator.callMessagesApi 的守卫),
+// 空密钥 = 尚未接入,判定一律走 fallback(见 evaluator.callChatApi 的守卫),
 // 与「没有判定规则就不放行」是同一套 fail-closed 思路 —— 克隆下来不配任何东西,
 // 服务能跑、大屏能看,但不会有一个岗位被自动投出去。
 export const DEFAULT_ENDPOINT = 'https://api.anthropic.com/v1/messages';
@@ -20,14 +20,15 @@ export const DEFAULT_MODEL = 'claude-haiku-4-5';
 
 export const DEFAULTS = {
   decisionPrompt: '',
-  greetingSamples: [],
+  greetingPrompt: '',
   aiEndpoint: DEFAULT_ENDPOINT,
   aiKey: '',
   aiModel: DEFAULT_MODEL,
 };
 export const MAX_PROMPT_CHARS = 4000;
-export const MAX_SAMPLES = 50;
-export const MAX_SAMPLE_CHARS = 200;
+// 招呼样式是给模型看的要求,不是逐字发出去的文本,所以可以比原来的固定句子长得多。
+// 1000 字足够写清「优先点什么、没有对得上的怎么办、什么语气、哪些别说」。
+export const MAX_GREETING_PROMPT_CHARS = 1000;
 export const MAX_ENDPOINT_CHARS = 300;
 export const MAX_KEY_CHARS = 300;
 export const MAX_MODEL_CHARS = 100;
@@ -63,14 +64,12 @@ export function normalizeSettings(raw) {
       typeof source.decisionPrompt === 'string'
         ? source.decisionPrompt.slice(0, MAX_PROMPT_CHARS)
         : '',
-    greetingSamples: Array.isArray(source.greetingSamples)
-      ? source.greetingSamples
-          .filter((sample) => typeof sample === 'string')
-          .map((sample) => sample.trim())
-          .filter(Boolean)
-          .slice(0, MAX_SAMPLES)
-          .map((sample) => sample.slice(0, MAX_SAMPLE_CHARS))
-      : [],
+    // 招呼样式:用户对「怎么写这句招呼语」的自由要求,进提示词,**不逐字发出**。
+    // 与 decisionPrompt 一样按字符截断,不抛错。
+    greetingPrompt:
+      typeof source.greetingPrompt === 'string'
+        ? source.greetingPrompt.slice(0, MAX_GREETING_PROMPT_CHARS)
+        : '',
     // 读取路径**不校验 URL 形态**:文件被手改坏时宁可让它跑到 fetch 那一步失败
     // (结果是 fallback),也不要因为一个可选配置读不出来就让服务起不来。
     aiEndpoint: textOr(source.aiEndpoint, DEFAULT_ENDPOINT, MAX_ENDPOINT_CHARS),
@@ -115,26 +114,16 @@ export function validatePatch(patch) {
     result.decisionPrompt = patch.decisionPrompt;
   }
 
-  if ('greetingSamples' in patch) {
-    if (!Array.isArray(patch.greetingSamples)) {
-      throw new Error('greetingSamples 必须是字符串数组');
+  if ('greetingPrompt' in patch) {
+    if (typeof patch.greetingPrompt !== 'string') {
+      throw new Error('greetingPrompt 必须是字符串');
     }
-    const cleaned = patch.greetingSamples
-      .map((sample) => {
-        if (typeof sample !== 'string') throw new Error('greetingSamples 里每一项都必须是字符串');
-        return sample.trim();
-      })
-      .filter(Boolean);
-
-    if (cleaned.length > MAX_SAMPLES) {
-      throw new Error(`招呼样例太多:${cleaned.length} 条,上限 ${MAX_SAMPLES} 条`);
+    // 提示词超长在保存这一刻就报错:静默截断会让用户以为「写进去的都生效了」,
+    // 而实际被砍掉的那半段往往正是最要紧的约束。
+    if (patch.greetingPrompt.length > MAX_GREETING_PROMPT_CHARS) {
+      throw new Error(`招呼样式太长:${patch.greetingPrompt.length} 字,上限 ${MAX_GREETING_PROMPT_CHARS} 字`);
     }
-    const tooLong = cleaned.find((sample) => sample.length > MAX_SAMPLE_CHARS);
-    if (tooLong) {
-      throw new Error(`招呼样例太长(${tooLong.length} 字,上限 ${MAX_SAMPLE_CHARS} 字):${tooLong.slice(0, 30)}…`);
-    }
-
-    result.greetingSamples = cleaned;
+    result.greetingPrompt = patch.greetingPrompt;
   }
 
   if ('aiEndpoint' in patch) {
@@ -191,10 +180,13 @@ export function createSettingsStore(file) {
   }
 
   function get() {
-    // 返回副本:调用方(如招呼语生成)会随手改数组,slices 一份免得把内部状态改掉。
+    // 返回副本:调用方会随手改里面取出来的对象,复制一份免得把内部状态改掉。
+    // 配置项现在全是字符串与数字,展开一层就够(以前有 greetingSamples 数组时
+    // 还要额外 slice 一次,那个字段已经并进 greetingPrompt 了)。
+    //
     // 用展开而不是逐字段列举 —— 否则以后再加配置项,漏补这里就会变成
     // 「存进去了但读不出来」,而且两边都不报错。
-    return { ...current, greetingSamples: current.greetingSamples.slice() };
+    return { ...current };
   }
 
   function save(patch) {

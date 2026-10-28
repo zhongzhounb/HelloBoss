@@ -31,6 +31,8 @@
 - 网络请求优先使用页面 fetch；当页面策略或跨域限制影响请求时，使用 `GM_xmlhttpRequest` 兜底。
 - UI 使用原生 DOM 和内联样式实现，不要改成 Vue / React / jQuery。
 - 服务侧的运行期数据（`data/`）与局域网令牌（`config/server.json`）都在 gitignore 里，**不要提交**。
+- `server/data/` 是用户唯一的配置与判定流水副本：不进 git，也没有自动备份。构建、打包、清理脚本一律不要删它；调试时也别为了「干净」去 `rm -rf data`。删掉就再也拼不回来了。
+- `launcher/build.mjs` 只清理代码产物，**保留** `dist/data`、`dist/config/server.json`、`dist/resumes` 里的用户内容。要分发时先手动清掉这些个人文件，别把简历、密钥或流水打进 zip。
 - 简历目录 `server/resumes/` 除 `example.txt` 外一律不进版本管理 —— 简历是个人信息。
 
 ## 两个必须守住的约束
@@ -61,19 +63,112 @@
 - `decideByPrompt` 解析 AI 配置必须用 `options.ai === undefined` 判断，**不能写 `ai.key || LEGACY_KEY`** ——
   那会让用户显式清空的密钥重新拿到旧默认值并发给远端。
 
+## 容易改错的地方
+
+### 大屏的内联 JS 住在外层模板字符串里，转义会咬人
+
+`dashboard.js` 整页由一个模板字符串吐出，所以里面那段 `<script>` 里的**任何转义都会被外层先解析一遍**：
+
+- 想在内联脚本里写换行，必须写成 `\\n`（双反斜杠），写 `\n` 会被外层解析成真换行，
+  把字符串字面量切成两行 —— 页面上表现为**整页 JS 全不执行**（按钮全没反应），
+  而模板本身完全合法，`node --check src/dashboard.js` 也查不出来。
+- 教训是连**注释里**都不能随手写 `\n`，同样会被切开。注释里就用文字描述。
+- `test/dashboard.test.js` 里有一条 `vm.Script` 编译内联脚本的用例专门守这个，
+  别删。它比人眼可靠：这个错只在浏览器里现形，服务端测试不改的话根本看不见。
+
+同理，在模板里写 CSS/HTML 时也留意 `${` 和反引号。
+
+### 招呼语由模型写，样式是一段要求而不是固定句子
+
+`evaluateJob` 里：`buildGreeting` 生成；生成失败或返回空串，才退到 `buildTemplateGreeting`。
+**中间没有「回落到用户写的固定句子」这一步了** —— 那条链路（`greetingSamples` /
+`pickSample` / `pickFreshSample` / `NO_MATCH` / `recentSentGreetings`）已经整套删掉，
+别再按旧结构去找。
+
+大屏「打招呼样式」存的 `greetingPrompt` 是**给模型的要求**，进 system prompt，不逐字发出。
+不要改成「存固定文案、原样发」：一字不变地连发几百遍正是账号被判群发的头号原因，
+而固定句子跟具体岗位无关。
+
+两个容易踩的点：
+
+- **样式要求只能加、不能盖掉硬性约束。** `buildGreetingSystemPrompt` 里「60 字以内」
+  「简历是唯一事实来源」这两条永远在，用户写「写长一点」也不该真的写 500 字。
+- **写给谁看决定了写到什么粒度**，这是这段 prompt 里最容易写错的地方。读者是 HR 不是工程师：
+  技术名词和中小公司名都要挡掉。早先那条「点名公司名 + 对上的技术点」的要求产出过
+  「飞之辰实习做过采购寻源平台后端，用 CompletableFuture 做详情接口异步化」——
+  一整句读完 HR 什么都没记住。改这条之前先想清楚读者是谁。
+- **别把简历从提示词里拿掉。** 有人会提「不要给 AI 看简历，直接按 JD 说有 xxx 经验」——
+  那样做，JD 里写「熟悉 Kubernetes」而简历里没有时，模型会替候选人认领。
+  简历要留着**当事实来源**，只是不许当**复述内容**。
+- **`stylePrompt` 只认字符串**，别写成 `String(x || '')` —— 配置被手改成数字时会把
+  「123」当成样式要求塞进提示词，那种错比忽略它难查得多。
+- **`buildResumeFacts` 不能按固定槽位取字段。** `.txt` 的「单位 | 时间 | 备注」把角色放在
+  `position`，`.typ` 宏格式把角色放在 `mid`、时间放在 `rule`。按槽位取必然漏掉其中一种，
+  而漏掉的正好是「实习岗位是什么」—— 模型看不见就写不出点名匹配的句子。
+  另:各部分字数上限（`RESUME_PROMPT_LIMITS`）受 12 秒招呼语超时约束，**调大会先撞上脚本侧
+  45 秒超时链**（见 server.js 顶部的超时预算注释），不要靠调大来提升质量。
+
+### 不要再把 `toString` 伪装加回来
+
+主脚本里原先的 `maskNative`（把包装过的 fetch/XHR/history 的 `toString` 伪造成原生）已经整套删掉，
+原地留了注释说明理由。简单说：改写 `Function.prototype.toString` 本身是最经典的检测点，被识破时
+性质从「疑似自动化」变成「确认在对抗风控」；而账号会不会被处置取决于节奏和文案重复度，跟这一层
+化妆无关。`zhipin-devtools-unlock.user.js` 里那套同理——正常投递时不要挂着它。
+
+### 平台的沟通提醒默认是停机信号
+
+`isPauseDialog` 让硬限制（次数用完）和**带数字的额度预警**（`还剩 N 次沟通` / `您今天已与 N 位`）
+都中断整轮，由配置项 `stopOnSoftReminder`（默认 true）控制。预警是平台动真格之前最后一次提醒，
+把它当障碍物点掉继续跑，代价是账号；停下来只损失当天剩下的岗位，明天还能补。
+
+注意 `findBossPlatformDialog` 里有两级判定：`softReminder`（宽松，含「温馨提示 + 沟通」）只用于
+决定「这是个可以点掉的提示」，`quotaWarning`（必须带数字）才是停机依据。**别把停机条件放宽到
+`softReminder`** —— 普通告知会被误判成预警，误伤几次用户就会把这个保护整个关掉，那才是真损失。
+
+## exe 模式下是两个进程，别把「停服务」做成进程内开关
+
+`HelloBoss.exe` 的引导层有三种身份（见 `server/launcher/bootstrap.cjs`）：父进程只负责派生一个
+隐藏的控制进程并退出；控制进程（`server/src/supervisor.js`）常驻，提供大屏、配置、记录与导出；
+判定服务是它的子进程，**默认不启动**，由大屏右上角的「启动服务 / 停止服务」拉起和杀掉。
+
+- 判定服务监听**临时端口**，端口号通过 stdout 的 `HELLOBOSS_WORKER_PORT=<port>` 握手回控制进程。
+  别改成固定端口：那会和别的实例 / 别的软件撞车。
+- 判定服务没启动时，控制进程对 `/evaluate` 回 503 并说明原因，**不要**在控制进程里直接判定 ——
+  那样「停止服务」就只是改了个布尔值，并没有真的停掉。
+- 保存配置后，控制进程要调用后台服务的 `/api/cache/clear`。只清自己进程里的缓存不够：
+  判定缓存长在后台服务里。
+- 判定服务的 stdin 管道是孤儿保护：控制进程死掉（尤其是 Windows 上被强杀）时管道断开，
+  子进程跟着退出。别把它改成 `ignore`。
+- 大屏的 `/api/watch` 只表示「有人看着控制台」，**不代表判定服务在运行**。按钮状态跟着
+  `/api/records` 里的 `service` 字段走，不要再用 SSE 连接去推断。
+- 局域网开关会先写 `config/server.json`、延迟 200ms 再重绑监听。先发响应再 close 是故意的：
+  `closeAllConnections()` 会把当前这条请求一起收掉，同步重绑的话页面收不到「已开启」。
+- 再双击一次 exe 不会复用旧控制进程：引导层先 `POST /api/shutdown` 请旧实例退出
+  （判定服务一起停掉），等端口释放后再起新实例。`/api/shutdown` 必须响应的 `finish`
+  事件之后才关服务，否则调用方只会看到连接被重置。旧版本没有这个接口时退回「只开网页」。
+
 ## 关键文件
 
 - `zhipin-auto-greeting.user.js`：主脚本，负责岗位筛选、自动沟通、记录存储、导出和控制面板。
 - `zhipin-devtools-unlock.user.js`：本地调试辅助脚本，降低页面反调试逻辑对 DevTools 的干扰。
-- `server/src/server.js`：HTTP 路由、鉴权、判定编排（`evaluateJob` 的 fail-closed 闸门在这里）。
-- `server/src/evaluator.js`：`callMessagesApi`（判定、招呼语、大屏的「测试连通」**共用这一处**调用）、
-  判定与招呼语 prompt。
+- `server/src/server.js`：HTTP 路由、鉴权、判定编排、判定服务的启停与局域网开关接口。
+  `evaluateJob` 的 fail-closed 闸门在这里。投递数量与时段都由脚本侧控制，服务端不做节流
+  —— 别把每日上限或允许时段加回来。
+- `server/src/supervisor.js`：exe 模式下的常驻控制进程（大屏 + 服务启停 + 局域网重绑）。
+- `server/src/workerController.js`：判定子进程的启动、停止、状态与 `/evaluate` 转发。
+- `server/src/evaluator.js`：`callChatApi`（判定、招呼语、大屏的「测试连通」**共用这一处**调用）、
+  判定与招呼语 prompt、`buildResumeFacts`（简历 → 提示词事实清单）、
+  `buildGreetingSystemPrompt`（把用户的打招呼样式拼进去）。
+  上游格式由 `detectApiFormat` 按端点路径自动识别 ——
+  `/chat/completions` 结尾走 OpenAI 格式，否则走 Anthropic Messages；加第三种格式只需在
+  这文件里多一对「拼请求 / 解析响应」，发请求与兜底那部分不用动。
 - `server/src/settings.js`：配置存取与校验、密钥脱敏。
 - `server/src/dashboard.js`：大屏页面，也是**唯一的配置入口**。里面的示例规则与示例招呼语
   必须保持脱敏 —— 那是给陌生人看的模板，不能混进任何真实公司名、地名或个人经历。
 - `server/src/{ledger,resumeParser,typst,variantSelector}.js`：流水存储、简历解析（`.txt` / `.typ`）与版本选择。
-- `server/src/idleExit.js`：大屏页面关掉后让服务自己退出。
-- `server/launcher/`：把服务打包成 `HelloBoss.exe` 的引导层与构建脚本。
+- `server/src/idleExit.js`：大屏页面关掉后让控制进程自己退出。
+- `server/launcher/`：`bootstrap.cjs`（三种身份）与 `build.mjs`（打包成 `HelloBoss.exe`）。
+  构建直接跑 `node launcher/build.mjs`，不再有任何 `.cmd` / `.vbs` 脚本。
 - 根目录 `README.md`：面向用户；`AGENTS.md`：面向 AI 维护者（本文件）。
 
 ## 代码规范

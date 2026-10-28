@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import { renderDashboardHtml } from '../src/dashboard.js';
 
 test('返回一个完整的 HTML 文档', () => {
@@ -44,17 +45,28 @@ test('上半屏含配置面板与柱状图容器', () => {
   }
   // 这些 id 是 JS 读写配置时按 id 取的,改名会静默失效 —— 一起守着。
   assert.ok(html.includes('id="decisionPrompt"'));
-  assert.ok(html.includes('id="samples"'));
+  assert.ok(html.includes('id="greetingPrompt"'));
   assert.ok(html.includes('id="chart"'));
 });
 
-test('顶部有全宽标题栏与服务状态按钮', () => {
+test('投递数量与时段不再出现在服务端配置里', () => {
+  const html = renderDashboardHtml();
+  // 两项完全由油猴脚本控制。服务端再留一份,只会出现「脚本以为还能投、
+  // 服务端已经拦下」的错位。
+  assert.ok(!html.includes('dailySendLimit'), '每日投递上限应已删除');
+  assert.ok(!html.includes('activeHours'), '允许投递时段应已删除');
+  assert.ok(!html.includes('投递时段'), '时段面板应已删除');
+});
+
+test('顶部有标题栏、服务开关与手机访问按钮', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes('HelloBoss'), '标题栏应写「HelloBoss」');
   assert.ok(html.includes('id="svcBtn"'));
-  // 打开时服务状态还没探测到,按钮就先显示「启动中」—— 不能一上来就说「运行中」,
-  // 那是在没验证过的情况下撒谎。
-  assert.match(html, /id="svcBtn"[^>]*>启动中</, '按钮初始文案应为「启动中」');
+  // 控制台默认不启动判定服务,按钮一开始就该是「启动服务」。
+  assert.match(html, /id="svcBtn"[^>]*>启动服务</, '按钮初始文案应为「启动服务」');
+  assert.ok(html.includes('id="lanBtn"'), '手机看大屏要能在页面里开关');
+  assert.ok(html.includes('id="ctrlStatus"'), '启停失败要有地方显示原因');
+  assert.ok(html.includes('id="lanInfo"'), '开启手机访问后要显示地址');
 });
 
 test('打招呼判定是「编辑 / 保存」双态', () => {
@@ -84,24 +96,37 @@ test('「填入示例」不覆盖已有内容', () => {
 });
 
 
-test('打招呼样式是带增删改的列表', () => {
+test('打招呼样式是一个 prompt 文本框,不再是固定句子列表', () => {
   const html = renderDashboardHtml();
-  assert.ok(html.includes('添加样式'), '列表底部要有「添加样式」');
-  assert.ok(html.includes("data-act=\"edit\"") || html.includes("data-act='edit'") || html.includes("'edit'"));
-  assert.ok(html.includes("'del'"), '每行要有删除');
-  assert.ok(html.includes("'commit'"), '编辑态要有确定');
-  assert.ok(html.includes("'cancel'"), '编辑态要有取消');
-  // 增删改都直接落盘,不需要再点保存。
-  assert.ok(html.includes('persistSamples'));
-  assert.ok(html.includes('greetingSamples'), '要提交 greetingSamples 字段');
-  // 列表每次重绘都会换掉所有按钮,必须用事件委托,否则监听器随重绘次数泄漏。
-  assert.ok(html.includes('addEventListener(\'click\'') && html.includes('data-act'));
-  assert.ok(html.includes("closest('button[data-act]')"), '应通过事件委托处理列表按钮');
+  assert.ok(html.includes('id="greetingPrompt"'), '样式要有多行输入');
+  assert.ok(html.includes('id="btnGreetingSave"'), '要有保存按钮');
+  // 这句必须写在面板上:用户以为「写进去的话会被原样发给招聘方」就什么都不敢写了,
+  // 而它其实只是给模型的要求。说不清这一点,这个框就废了。
+  assert.ok(html.includes('不逐字发出'), '要说清这是给 AI 的要求,不是要发出去的文本');
+  // 旧那套「一行一条、增删改」的列表应该彻底消失 —— 留着一半最糟糕。
+  assert.ok(!html.includes('id="samples"'), '不该再有固定句子列表');
+  assert.ok(!html.includes('persistSamples'));
 });
 
 test('下半屏也用面板框住', () => {
   const html = renderDashboardHtml();
   assert.match(html, /class="bottom panel"/, '下半部分应当也是 panel,才有边框');
+});
+
+test('记录表的时间列带日期,并按日期+时间排序后只留最近 100 条', () => {
+  const html = renderDashboardHtml();
+  // 跨天挂机时只有时分秒会让昨天的记录和今天的分不开。
+  assert.ok(html.includes("pad(d.getMonth() + 1) + '/' + pad(d.getDate())"), '时间列要显示「月/日」');
+  assert.ok(html.includes('var MAX_ROWS = 100;'), '默认只保留最近 100 条');
+  // /report 不等待响应,到达顺序未必等于 at 的先后 —— 每行带 at,插入时按它定位。
+  assert.ok(html.includes('data-at='), '行上要带 at 供排序');
+  assert.ok(html.includes('function insertRecord'), '应按时间戳找位置插入,不能一股脑插表头');
+  // 列表从早到晚,超上限时裁掉的是表头(最旧)那条。
+  assert.ok(html.includes('rowsEl.removeChild(rowsEl.firstChild)'), '保留最近 100 条 = 裁掉最旧的');
+  // 最新一条在表尾,追加后要跟着滚到底;用户往上翻时不抢滚动位置。
+  assert.ok(html.includes('id="tableWrap"'), '滚动容器要能被脚本取到');
+  assert.ok(html.includes('tableWrapEl.scrollTop = tableWrapEl.scrollHeight'), '新记录到达时自动滚到底');
+  assert.ok(html.includes('var follow = isAtBottom()'), '只在原本贴底时跟随');
 });
 
 
@@ -197,26 +222,31 @@ test('没加载到简历时有单独的警告条，依据是 /health 的 profile
   assert.ok(html.includes('health.profiles === 0'), '警告条的显示条件要接在 /health 的结果上');
 });
 
-test('大屏挂一条长连接给服务端当「有人在看」的信号', () => {
+test('大屏挂一条长连接给控制进程当「有人在看」的信号', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes("new EventSource('/api/watch')"), '要连上 /api/watch 这条流');
-  // 状态灯的依据就是这条连接:连上变绿、断了变红(EventSource 自己会重连)。
-  assert.ok(html.includes("watch.addEventListener('open'"), '连上要反映到状态灯上');
-  assert.ok(html.includes("watch.addEventListener('error'"), '断了也要反映到状态灯上');
   assert.ok(html.includes('openWatch();'), '首屏就要把这条连接挂上,不能等用户点按钮');
+  // 这条连接只回答「页面还在不在」。判定服务开没开是另一回事,不能拿连接状态推断 ——
+  // 判定服务停着时,控制台和大屏连接都好好的。
+  assert.ok(!html.includes("watch.addEventListener('open'"), 'SSE 连接不该再写服务按钮');
 });
 
-test('状态灯只有一个写入者,不会几处各写各的', () => {
+test('服务开关的状态跟着 /api/records 的 service 字段走', () => {
   const html = renderDashboardHtml();
-  // 以前 poll()(1.5 秒一次)失败也会把灯拨红,于是 /api/records 偶发抖动时
-  // 会出现「服务好好的,灯却是红的」。现在只有那条长连接说了算。
-  assert.doesNotMatch(html, /svcState/, '不该再有第二个状态变量跟着抢着改灯');
-  // 切到 poll() 结束(下一个分区注释)为止,别用固定字符数 —— 切短了这条断言就形同虚设。
-  const pollBody = html.slice(html.indexOf('function poll()'), html.indexOf('// ---- 配置读写 ----'));
-  assert.doesNotMatch(pollBody, /setSvcState/, 'poll() 不该再改状态灯,失败提示交给顶部的横幅');
+  assert.ok(html.includes('applyService(data.service)'), '轮询响应里带服务状态,不必另起定时器');
+  assert.ok(html.includes("var action = service.running ? 'stop' : 'start'"), '按钮是按当前状态启停');
+  assert.ok(html.includes("postJson('/api/service/' + action"), '启停要走 /api/service');
+  assert.doesNotMatch(html, /svcState/, '不该再有旧的连接状态变量');
 });
 
-test('页面上写清了「服务跟着本页,关掉就停」', () => {
+test('手机看大屏由页面开关,不再依赖单独的 .cmd 脚本', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes("fetch('/api/lan')"), '加载时要读当前局域网状态');
+  assert.ok(html.includes("postJson('/api/lan'"), '开关要走 /api/lan');
+  assert.ok(html.includes('关闭手机访问'), '开着时按钮要能关掉');
+});
+
+test('页面上写清了「控制台跟着本页,关掉就停」', () => {
   const html = renderDashboardHtml();
   // 这是行为的一部分,不能只写在 README 里:用户关掉页面的那一刻,
   // 判定服务就没了,而判定是 fail-closed —— 后果是一个岗位都不投,却看不出为什么。
@@ -252,12 +282,41 @@ test('判定规则的「填入示例」是脱敏过的通用模板', () => {
 
 test('招呼语面板有「填入示例」，且示例文案不含真实卖点', () => {
   const html = renderDashboardHtml();
-  assert.ok(html.includes('id="btnSampleGreeting"'), '招呼语面板应有「填入示例」按钮');
-  assert.ok(
-    html.includes('硕士毕业、大厂实习过、项目对口、拿过竞赛奖,很划算的!'),
-    '示例招呼语应存在',
-  );
-  assert.ok(!html.includes('985硕'), '示例招呼语不得包含真实学历');
-  assert.ok(!html.includes('国奖竞赛'), '示例招呼语不得包含真实奖项');
+  assert.ok(html.includes('id="btnGreetingSample"'), '招呼语面板应有「填入示例」按钮');
+  assert.ok(html.includes('SAMPLE_GREETING_PROMPT'), '示例常量应存在');
+  // 示例是给陌生人看的模板,不能混进真实学历/奖项 —— 与规则面板同一条规矩。
+  assert.ok(!html.includes('985硕'), '示例不得包含真实学历');
+  assert.ok(!html.includes('国奖竞赛'), '示例不得包含真实奖项');
 });
 
+
+test('内联 JS 里每个 getElementById 都能在页面里找到对应元素', () => {
+  const html = renderDashboardHtml();
+  const [script] = html.match(/<script>([\s\S]*?)<\/script>/).slice(1);
+
+  const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+  const used = [...new Set([...script.matchAll(/getElementById\(['"]([^'"]+)['"]\)/g)].map((m) => m[1]))];
+  const missing = used.filter((id) => !ids.has(id));
+
+  // 少一个 id 不会让页面报错,只会让对应的功能静默失效(比如配置读回来填不进输入框),
+  // 所以在测试里挡住,而不是等大屏上看到空框才发现。
+  assert.deepEqual(missing, [], `这些元素取不到:${missing.join(', ')}`);
+});
+
+test('内联 JS 是完整可解析的一段脚本', () => {
+  const html = renderDashboardHtml();
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.equal(scripts.length, 1, '零依赖约定:只应有一段内联脚本');
+  assert.ok(scripts[0][1].includes('function'), '内联脚本不该是空壳');
+});
+
+test('内联脚本能编译 —— 外层模板字符串的转义错误在这里现形', () => {
+  const html = renderDashboardHtml();
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+
+  // vm.Script 只编译不执行，不需要 DOM。它抓的是一类**只在浏览器里才现形**的错误:
+  // 整段页面住在一个模板字符串里，内联脚本里写 '\n' 会被外层先解析成真换行，
+  // 把字符串字面量切成两行。模板本身完全合法，测试不改的话页面表现为
+  // 「整页 JS 全不执行」—— 按钮全没反应，控制台一行红字。要写 \\n。
+  assert.doesNotThrow(() => new vm.Script(script), '内联脚本必须语法合法');
+});

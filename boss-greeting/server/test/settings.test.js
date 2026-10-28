@@ -27,21 +27,19 @@ test('缺字段与非法类型一律退回默认值', () => {
   assert.deepEqual(normalizeSettings(undefined), ALL_DEFAULTS);
   assert.deepEqual(normalizeSettings(null), ALL_DEFAULTS);
   assert.deepEqual(normalizeSettings('不是对象'), ALL_DEFAULTS);
-  assert.deepEqual(normalizeSettings({ decisionPrompt: 42, greetingSamples: '不是数组' }), ALL_DEFAULTS);
+  assert.deepEqual(normalizeSettings({ decisionPrompt: 42, greetingPrompt: 99 }), ALL_DEFAULTS);
 });
 
-test('读取时清掉空行、非字符串项与超长项', () => {
-  const result = normalizeSettings({
-    decisionPrompt: '规则',
-    greetingSamples: ['  985硕  ', '', '   ', 42, null, '中秋节快乐'],
-  });
+test('读取时招呼样式不是字符串就退回空串,而不是让服务起不来', () => {
+  const result = normalizeSettings({ decisionPrompt: '规则', greetingPrompt: 42 });
   assert.equal(result.decisionPrompt, '规则');
-  assert.deepEqual(result.greetingSamples, ['985硕', '中秋节快乐']);
+  assert.equal(result.greetingPrompt, '');
 });
 
 test('读取时超长内容被截断而不是丢弃', () => {
-  const long = 'a'.repeat(300);
-  assert.equal(normalizeSettings({ greetingSamples: [long] }).greetingSamples[0].length, 200);
+  // 读取路径宽松:手改坏的文件不该让服务起不来。
+  assert.equal(normalizeSettings({ decisionPrompt: 'a'.repeat(5000) }).decisionPrompt.length, 4000);
+  assert.equal(normalizeSettings({ greetingPrompt: 'a'.repeat(5000) }).greetingPrompt.length, 1000);
 });
 
 // ---- validatePatch（保存路径：严格，要报错给人看） ----
@@ -50,24 +48,21 @@ test('保存时非字符串 prompt 被拒', () => {
   assert.throws(() => validatePatch({ decisionPrompt: 42 }), /必须是字符串/);
 });
 
-test('保存时非数组 samples 被拒', () => {
-  assert.throws(() => validatePatch({ greetingSamples: '一条' }), /必须是字符串数组/);
-});
-
-test('保存时数组里混入非字符串被拒', () => {
-  assert.throws(() => validatePatch({ greetingSamples: ['ok', 42] }), /每一项都必须是字符串/);
+test('保存时非字符串样式被拒', () => {
+  assert.throws(() => validatePatch({ greetingPrompt: 42 }), /必须是字符串/);
 });
 
 test('保存时超长 prompt 被拒而不是静默截断', () => {
   assert.throws(() => validatePatch({ decisionPrompt: 'x'.repeat(4001) }), /太长/);
 });
 
-test('保存时超长样例被拒', () => {
-  assert.throws(() => validatePatch({ greetingSamples: ['y'.repeat(201)] }), /太长/);
+test('保存时超长样式被拒而不是静默截断', () => {
+  // 静默截断会让用户以为「写进去的都生效了」,而被砍掉的往往正是最要紧的约束。
+  assert.throws(() => validatePatch({ greetingPrompt: 'y'.repeat(1001) }), /招呼样式太长/);
 });
 
-test('保存时空行被清掉但不算错', () => {
-  assert.deepEqual(validatePatch({ greetingSamples: ['  a  ', '', '   '] }).greetingSamples, ['a']);
+test('保存时空样式合法 —— 表示「不加额外要求」', () => {
+  assert.equal(validatePatch({ greetingPrompt: '' }).greetingPrompt, '');
 });
 
 test('只接受已知字段，多余的键被忽略', () => {
@@ -90,9 +85,9 @@ test('文件不存在时返回默认值', () => {
 test('保存后能读回，且换个实例（模拟重启）也读得回', () => {
   const file = tempFile();
   const store = createSettingsStore(file);
-  store.save({ decisionPrompt: '20k 以上直接投', greetingSamples: ['985硕'] });
+  store.save({ decisionPrompt: '20k 以上直接投', greetingPrompt: '不要用感叹号。' });
 
-  const expected = { ...ALL_DEFAULTS, decisionPrompt: '20k 以上直接投', greetingSamples: ['985硕'] };
+  const expected = { ...ALL_DEFAULTS, decisionPrompt: '20k 以上直接投', greetingPrompt: '不要用感叹号。' };
   assert.deepEqual(store.get(), expected);
 
   const reopened = createSettingsStore(file);
@@ -101,18 +96,19 @@ test('保存后能读回，且换个实例（模拟重启）也读得回', () =>
 
 test('保存是合并而不是整体替换，未提交的字段保持原值', () => {
   const store = createSettingsStore(tempFile());
-  store.save({ decisionPrompt: '规则', greetingSamples: ['样例'] });
-  store.save({ greetingSamples: ['新样例'] });
+  store.save({ decisionPrompt: '规则', greetingPrompt: '旧样式' });
+  store.save({ greetingPrompt: '新样式' });
 
-  assert.deepEqual(store.get(), { ...ALL_DEFAULTS, decisionPrompt: '规则', greetingSamples: ['新样例'] });
+  assert.deepEqual(store.get(), { ...ALL_DEFAULTS, decisionPrompt: '规则', greetingPrompt: '新样式' });
 });
 
-test('get 返回副本，外部改数组不会污染内部状态', () => {
+test('get 返回副本，外部改返回对象不会污染内部状态', () => {
+  // 配置项现在全是字符串与数字,所以只需要防「调用方改返回对象本身」。
   const store = createSettingsStore(tempFile());
-  store.save({ greetingSamples: ['一条'] });
-  store.get().greetingSamples.push('外部塞进来的');
+  store.save({ greetingPrompt: '原来的样式' });
+  store.get().greetingPrompt = '被外部改掉的';
 
-  assert.deepEqual(store.get().greetingSamples, ['一条']);
+  assert.equal(store.get().greetingPrompt, '原来的样式');
 });
 
 test('文件损坏时退回默认值且不抛，服务照常可用', () => {
@@ -209,4 +205,15 @@ test('redactSettings 在未配置密钥时不给出提示', () => {
   const redacted = redactSettings({ aiKey: '' });
   assert.equal(redacted.hasAiKey, false);
   assert.equal(redacted.aiKeyHint, '');
+});
+
+test('服务端不再保存投递数量与时段配置', () => {
+  // 这两项现在完全由油猴脚本控制。老配置文件里残留的字段读取时会被忽略,
+  // 保存时也不会被写回去 —— 否则大屏上看似删掉的设置会一直存活在 JSON 里。
+  const settings = normalizeSettings({ dailySendLimit: 40, activeHoursStart: 8, activeHoursEnd: 22 });
+
+  assert.equal('dailySendLimit' in settings, false);
+  assert.equal('activeHoursStart' in settings, false);
+  assert.equal('activeHoursEnd' in settings, false);
+  assert.deepEqual(validatePatch({ dailySendLimit: 40, activeHoursStart: 8 }), {});
 });

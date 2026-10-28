@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createServer, evaluateJob, isLoopbackAddress, isRequestAuthorized, loadServerConfig, isCrossOriginWrite } from '../src/server.js';
+import { createServer, evaluateJob, buildGreetingViaLlm, isLoopbackAddress, isRequestAuthorized, loadServerConfig, isCrossOriginWrite } from '../src/server.js';
 import { createIdleExit } from '../src/idleExit.js';
 import { createSettingsStore } from '../src/settings.js';
 
@@ -35,8 +35,6 @@ function makeDeps(over = {}) {
       return store;
     })(),
     decideByPrompt: async () => ({ apply: true, reason: '规则命中', fallback: false }),
-    // 默认没配招呼样式 —— 走 AI 生成那条路。配了样式的分支有专门的用例守着。
-    pickGreetingSample: () => '',
     buildGreeting: async () => '您好,我是张三,来自示例大学。',
     ...over,
   };
@@ -145,28 +143,31 @@ test('生成返回空串时退回模板,判定通过仍投递', async () => {
   assert.match(result.greeting, /张三/);
 });
 
-test('配了招呼样式时原样发出那一条,不再调生成', async () => {
-  // 样例是用户自己写、自己认的内容 —— 直发出去,杜绝模型拿简历自由发挥
-  // (示例简历那回就发出过「我是示例大学张三」)。
+test('招呼语一律由模型写，不再回落到固定句子', async () => {
+  // 固定句子的好处是每个字都经过确认,代价是跟岗位无关 —— 一字不变地连发几百遍
+  // 正是账号被判群发的头号原因。现在「匹配不上怎么自荐」也写成样式要求,交给模型。
   let greetingCalls = 0;
   const deps = makeDeps({
-    pickGreetingSample: () => '985硕,大厂实习,很划算的!',
-    buildGreeting: async () => { greetingCalls += 1; return 'AI 生成的句子'; },
+    buildGreeting: async () => {
+      greetingCalls += 1;
+      return '看到岗位要做上位机开发，我在海信实习时正好独立做过 Qt 上位机客户端。';
+    },
   });
 
   const result = await evaluateJob(JOB_OK, deps);
   assert.equal(result.apply, true);
-  assert.equal(result.greeting, '985硕,大厂实习,很划算的!', '样例应原样发出,不被改写');
-  assert.equal(greetingCalls, 0, '样例直发时不该再调一次生成');
-  assert.equal(result.meta.greetingFallback, false, '样例直发不是兜底');
+  assert.match(result.greeting, /海信/);
+  assert.equal(greetingCalls, 1, '每一单都要问一次模型');
+  assert.equal(result.meta.greetingFallback, false, '模型写的不是兜底');
 });
 
-test('没配招呼样式时仍走生成', async () => {
-  const deps = makeDeps({ pickGreetingSample: () => '' });
+test('生成返回空串时退到模板招呼语,并如实标记', async () => {
+  // 判定已经通过,不该因为一句措辞把岗位丢掉 —— 模板句再泛也发得出去。
+  const deps = makeDeps({ buildGreeting: async () => '' });
 
   const result = await evaluateJob(JOB_OK, deps);
-  assert.match(result.greeting, /张三/, '空样例不该把招呼语变成空串');
-  assert.equal(result.meta.greetingFallback, false);
+  assert.ok(result.greeting.length > 0, '不能因为没生成出措辞就丢掉岗位');
+  assert.equal(result.meta.greetingFallback, true);
 });
 
 test('相同 signature 第二次命中缓存,不再调 LLM', async () => {
@@ -584,7 +585,7 @@ test('evaluateJob: 没配规则时一个岗位都不投', async () => {
   // 一个"没配就开投"的版本会让他在不知情的情况下按别人的标准投递。
   let called = 0;
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '   ', greetingSamples: [] }) },
+    settings: { get: () => ({ decisionPrompt: '   ', greetingPrompt: '' }) },
     decideByPrompt: async () => { called += 1; return { apply: true, reason: 'x', fallback: false }; },
   });
 
@@ -607,7 +608,7 @@ test('evaluateJob: 没有简历时一个岗位都不投,且不调 LLM、不抛�
     profileOf: () => undefined,
     selectVariant: () => ({ variant: null, score: 0, evidence: [] }),
     // 刻意给一条**非空**规则:证明「有规则但没简历」也照样不放行。
-    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingSamples: [] }) },
+    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '' }) },
     decideByPrompt: async () => { called += 1; return { apply: true, reason: 'x', fallback: false }; },
   });
 
@@ -624,7 +625,7 @@ test('evaluateJob: 没有简历时一个岗位都不投,且不调 LLM、不抛�
 test('evaluateJob: 配了规则时把规则原文交给裁决函数', async () => {
   let calledWith = '';
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingSamples: [] }) },
+    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '' }) },
     decideByPrompt: async (job, profile, ruleText) => {
       calledWith = ruleText;
       return { apply: true, reason: '城市命中', fallback: false };
@@ -639,7 +640,7 @@ test('evaluateJob: 配了规则时把规则原文交给裁决函数', async () =
 
 test('evaluateJob: 规则裁决失败时按「判不了」处理,不是「判定不投」', async () => {
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '规则', greetingSamples: [] }) },
+    settings: { get: () => ({ decisionPrompt: '规则', greetingPrompt: '' }) },
     decideByPrompt: async () => ({ apply: false, reason: '', fallback: true, error: '端点超时' }),
   });
 
@@ -652,7 +653,7 @@ test('evaluateJob: 规则裁决失败时按「判不了」处理,不是「判定
 
 test('GET /api/settings 返回已保存的配置', async () => {
   const store = makeStore();
-  store.save({ decisionPrompt: '20k 以上直接投', greetingSamples: ['985硕'] });
+  store.save({ decisionPrompt: '20k 以上直接投', greetingPrompt: '不要用感叹号。' });
 
   const server = makeServer({ deps: makeDeps({ settings: store }) });
   await new Promise((r) => server.listen(0, r));
@@ -660,7 +661,7 @@ test('GET /api/settings 返回已保存的配置', async () => {
 
   const body = await (await fetch(`http://127.0.0.1:${port}/api/settings`)).json();
   assert.equal(body.decisionPrompt, '20k 以上直接投');
-  assert.deepEqual(body.greetingSamples, ['985硕']);
+  assert.equal(body.greetingPrompt, '不要用感叹号。');
 
   server.close();
 });
@@ -687,13 +688,13 @@ test('POST /api/settings 保存后能读回', async () => {
   const res = await fetch(`${url}/api/settings`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ decisionPrompt: '规则 A', greetingSamples: ['样例 1', '样例 2'] }),
+    body: JSON.stringify({ decisionPrompt: '规则 A', greetingPrompt: '语气别太推销。' }),
   });
   assert.equal(res.status, 200);
 
   const body = await (await fetch(`${url}/api/settings`)).json();
   assert.equal(body.decisionPrompt, '规则 A');
-  assert.deepEqual(body.greetingSamples, ['样例 1', '样例 2']);
+  assert.equal(body.greetingPrompt, '语气别太推销。');
   // 落盘也要确认 —— 只进内存的话重启就丢了。
   assert.equal(store.get().decisionPrompt, '规则 A');
 
@@ -708,11 +709,11 @@ test('POST /api/settings 非法输入返回 400 并带原因', async () => {
   const res = await fetch(`http://127.0.0.1:${port}/api/settings`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ greetingSamples: '不是数组' }),
+    body: JSON.stringify({ greetingPrompt: 'x'.repeat(1001) }),
   });
   assert.equal(res.status, 400);
   // 原因要能直接显示给用户看,不能是笼统的「参数错误」。
-  assert.match((await res.json()).error, /字符串数组/);
+  assert.match((await res.json()).error, /招呼样式太长/);
 
   server.close();
 });
@@ -1064,6 +1065,34 @@ test('POST /api/ai/test 用页面上填的端点/模型/密钥探测', async () 
   server.close();
 });
 
+test('POST /api/ai/test 回一个 format,说明这次按哪种格式打的', async () => {
+  // 格式是按端点地址自动识别的,用户没有别的办法确认它判成了哪一种 ——
+  // 填了个看不出格式的中转时,大屏上就靠这个字段解释「为什么报了 400」。
+  const server = makeServer({ deps: makeDeps({ settings: makeStore(), testAi: async () => {} }) });
+  await new Promise((r) => server.listen(0, r));
+
+  const chat = await (await postTest(server, { aiEndpoint: 'https://api.commandcode.ai/provider/v1/chat/completions' })).json();
+  assert.equal(chat.format, 'openai');
+
+  const messages = await (await postTest(server, { aiEndpoint: 'https://api.anthropic.com/v1/messages' })).json();
+  assert.equal(messages.format, 'anthropic');
+
+  server.close();
+});
+
+test('POST /api/ai/test 失败时也带上 format', async () => {
+  const server = makeServer({
+    deps: makeDeps({ testAi: async () => { throw new Error('接口返回 HTTP 401(按 OpenAI chat/completions 格式请求)'); } }),
+  });
+  await new Promise((r) => server.listen(0, r));
+
+  const body = await (await postTest(server, { aiEndpoint: 'https://x/v1/chat/completions' })).json();
+  assert.equal(body.ok, false);
+  assert.equal(body.format, 'openai', '失败时更要知道它按哪种格式打的,否则无从判断是不是端点填错了');
+
+  server.close();
+});
+
 test('POST /api/ai/test 密钥留空时回落到已保存的密钥', async () => {
   // 密钥框永远不回填,想验证存着的那把就只能留空点测试 ——
   // 这条与保存时「空 aiKey = 不修改」是同一个约定(见 settings.validatePatch)。
@@ -1151,3 +1180,350 @@ test('POST /api/ai/test 在服务没接探测能力时回 503', async () => {
   server.close();
 });
 
+
+// ---- 招呼语全链路（拼提示词 → 调模型）----
+
+// 用真实的 buildGreetingViaLlm 串起来，只把最外面的 callLlm 换成桩 ——
+// 这条链断了不会报错，只会静默退化成「每次都发模板句」，所以要端到端守。
+//
+// 简历必须有实习和项目:makeDeps 的默认桩只有教育 + 技能，而「点名实习/项目」
+// 正是这个功能要守的东西 —— 用默认桩等于把要验的素材抽掉了。
+const GREETING_PROFILE = {
+  variant: 'iot',
+  name: '张三',
+  sections: {
+    education: [{ title: '中国海洋大学（985）', time: '2024.09 -- 2027.06', position: '硕士 · 计算机技术', descs: [] }],
+    experience: [{
+      title: '海信（Hisense）',
+      time: '2026.06 -- 2026.09',
+      position: '测试开发实习生',
+      descs: [{ label: '上位机客户端开发', content: '独立完成 Qt 上位机客户端开发。' }],
+    }],
+    projects: [{ title: '分布式卡牌对战系统', time: '2025.06 -- 2026.03', position: '全栈独立开发', descs: [] }],
+    skills: [{ label: 'C/C++ 与上位机开发', content: '熟悉 Qt' }],
+  },
+};
+
+function greetingDeps(replyText, options = {}) {
+  const calls = [];
+  return {
+    calls,
+    deps: makeDeps({
+      profileOf: () => GREETING_PROFILE,
+      buildGreeting: (job, profile) => buildGreetingViaLlm(job, profile, {
+        stylePrompt: options.stylePrompt || '',
+        callLlm: async (system, user) => {
+          calls.push({ system, user });
+          if (replyText instanceof Error) throw replyText;
+          return replyText;
+        },
+      }),
+      ...(options.deps || {}),
+    }),
+  };
+}
+
+test('提示词里带上实习与项目，模型输出被原样采用', async () => {
+  const matched = '看到岗位要做上位机开发，我在海信实习时独立完成过多级检测界面的 Qt 上位机客户端。';
+  const { deps, calls } = greetingDeps(matched);
+
+  const result = await evaluateJob(JOB_OK, deps);
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].user, /实习:/, '提示词必须带上实习段');
+  assert.match(calls[0].user, /项目:/, '提示词必须带上项目段');
+  assert.match(calls[0].user, /海信/);
+  assert.equal(result.greeting, matched);
+});
+
+test('样式要求全链路进到 system，不逐字变成招呼语', async () => {
+  const style = '不要用感叹号，也别提薪资。';
+  const { deps, calls } = greetingDeps('我在海信实习时做过 Qt 上位机客户端。', { stylePrompt: style });
+
+  const result = await evaluateJob(JOB_OK, deps);
+
+  assert.ok(calls[0].system.includes(style), '样式要求要进 system');
+  assert.doesNotMatch(result.greeting, /感叹号/, '样式是要求，不是要发出去的文本');
+  assert.equal(result.greeting, '我在海信实习时做过 Qt 上位机客户端。');
+});
+
+test('模型调用抛错时退到模板,判定通过仍投递', async () => {
+  const { deps } = greetingDeps(new Error('上游 500'));
+
+  const result = await evaluateJob(JOB_OK, deps);
+
+  assert.equal(result.apply, true, '判定已通过，不该因为措辞失败就不投');
+  assert.ok(result.greeting.length > 0);
+  assert.equal(result.meta.greetingFallback, true, '用了模板就要如实标记');
+});
+
+test('模型回空串时同样走模板兜底', async () => {
+  const { deps } = greetingDeps('   ');
+
+  const result = await evaluateJob(JOB_OK, deps);
+
+  assert.ok(result.greeting.length > 0);
+  assert.equal(result.meta.greetingFallback, true);
+});
+
+// ---- 判定服务的启停(HelloBoss.exe 的控制进程模式)----
+//
+// 控制进程自己提供大屏,判定跑在可启停的子进程里。这里用桩代替子进程,
+// 只验路由契约:状态、启停、未启动时 /evaluate 的明确拒绝、以及配置变更
+// 会不会通知后台服务清缓存。
+
+function serviceStub(over = {}) {
+  let running = over.running === true;
+  const calls = { start: 0, stop: 0, clear: 0, forward: 0 };
+
+  const status = () => ({
+    managed: true,
+    running,
+    state: running ? 'running' : 'stopped',
+    port: running ? 12345 : null,
+  });
+
+  return {
+    calls,
+    status,
+    isRunning: () => running,
+    start: async () => { calls.start += 1; running = true; return status(); },
+    stop: async () => { calls.stop += 1; running = false; return status(); },
+    clearCache: () => { calls.clear += 1; },
+    forwardEvaluate: (raw, res) => {
+      calls.forward += 1;
+      const payload = JSON.stringify({
+        apply: true,
+        reason: '来自后台服务',
+        greeting: '您好',
+        meta: { forwarded: true },
+        raw,
+      });
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': Buffer.byteLength(payload),
+      });
+      res.end(payload);
+    },
+  };
+}
+
+async function listenOn(server) {
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('/api/service: 状态与启停走控制进程', async () => {
+  const control = serviceStub();
+  const server = makeServer({ serviceControl: control });
+  const base = await listenOn(server);
+
+  const before = await (await fetch(`${base}/api/service`)).json();
+  assert.equal(before.managed, true);
+  assert.equal(before.running, false);
+
+  const started = await (await fetch(`${base}/api/service/start`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  })).json();
+  assert.equal(started.running, true);
+  assert.equal(control.calls.start, 1);
+
+  const stopped = await (await fetch(`${base}/api/service/stop`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  })).json();
+  assert.equal(stopped.running, false);
+  assert.equal(control.calls.stop, 1);
+
+  server.close();
+});
+
+test('/api/service: 跨站写入被拒绝', async () => {
+  const control = serviceStub();
+  const server = makeServer({ serviceControl: control });
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/api/service/start`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+    body: '{}',
+  });
+
+  assert.equal(res.status, 403);
+  assert.equal(control.calls.start, 0, '跨站请求不能把服务拉起来');
+  server.close();
+});
+
+test('/api/shutdown: 新一次启动可以请旧控制进程退出', async () => {
+  let calls = 0;
+  const server = makeServer({ shutdownControl: () => { calls += 1; } });
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/api/shutdown`, { method: 'POST' });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).ok, true);
+
+  // 退出动作挂在响应的 finish 事件上:先回 200,再关服务。否则调用方只会看到
+  // 「连接被重置」,误以为旧实例没答应退出。
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(calls, 1);
+
+  server.close();
+});
+
+test('/api/shutdown: 跨站请求不能停掉控制进程', async () => {
+  let calls = 0;
+  const server = makeServer({ shutdownControl: () => { calls += 1; } });
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/api/shutdown`, {
+    method: 'POST',
+    headers: { origin: 'https://evil.example' },
+  });
+
+  assert.equal(res.status, 403);
+  assert.equal(calls, 0);
+  server.close();
+});
+
+test('/api/shutdown: 命令行启动时没有可退出的控制进程', async () => {
+  const server = makeServer();
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/api/shutdown`, { method: 'POST' });
+  assert.equal(res.status, 503);
+
+  server.close();
+});
+
+test('/evaluate: 服务未启动明确回 503,启动后转发给后台服务', async () => {
+  const control = serviceStub();
+  const server = makeServer({ serviceControl: control });
+  const base = await listenOn(server);
+  const evaluate = () => fetch(`${base}/evaluate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ job: JOB_OK }),
+  });
+
+  const off = await evaluate();
+  assert.equal(off.status, 503);
+  assert.match((await off.json()).error, /未启动/);
+  assert.equal(control.calls.forward, 0, '服务没起来就不该转发');
+
+  await fetch(`${base}/api/service/start`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+
+  const on = await evaluate();
+  assert.equal(on.status, 200);
+  const body = await on.json();
+  assert.equal(body.meta.forwarded, true);
+  assert.ok(body.raw.includes('"job"'), '原始请求体要原样转给后台服务');
+
+  server.close();
+});
+
+test('/api/records 带上服务状态,大屏不必另起一个轮询', async () => {
+  const control = serviceStub({ running: true });
+  const server = makeServer({ serviceControl: control });
+  const base = await listenOn(server);
+
+  const body = await (await fetch(`${base}/api/records`)).json();
+  assert.equal(body.service.managed, true);
+  assert.equal(body.service.running, true);
+
+  server.close();
+});
+
+test('命令行启动时 /api/service 报「不由大屏管理」', async () => {
+  const server = makeServer();
+  const base = await listenOn(server);
+
+  const body = await (await fetch(`${base}/api/service`)).json();
+  assert.equal(body.managed, false);
+  assert.equal(body.running, true, '命令行模式下判定就在本进程里,一直是运行中');
+
+  const res = await fetch(`${base}/api/service/stop`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(res.status, 503);
+
+  server.close();
+});
+
+test('保存配置会通知后台服务清掉判定缓存', async () => {
+  const control = serviceStub({ running: true });
+  const server = makeServer({ serviceControl: control });
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/api/settings`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ decisionPrompt: '只投青岛' }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(control.calls.clear, 1);
+
+  server.close();
+});
+
+test('/api/lan: 读取状态与开关局域网', async () => {
+  const lan = {
+    enabled: false,
+    calls: [],
+    status() {
+      return {
+        managed: true,
+        enabled: this.enabled,
+        token: 'test-token',
+        urls: this.enabled ? ['http://192.168.1.2:8787/dashboard?token=test-token'] : [],
+      };
+    },
+    async setEnabled(enabled) {
+      this.calls.push(enabled);
+      this.enabled = enabled;
+      return this.status();
+    },
+  };
+  const server = makeServer({ lanControl: lan });
+  const base = await listenOn(server);
+
+  const before = await (await fetch(`${base}/api/lan`)).json();
+  assert.equal(before.enabled, false);
+
+  const on = await (await fetch(`${base}/api/lan`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true }),
+  })).json();
+  assert.equal(on.enabled, true);
+  assert.equal(on.urls.length, 1);
+  assert.deepEqual(lan.calls, [true]);
+
+  server.close();
+});
+
+test('/api/lan: 命令行启动时不让页面改局域网', async () => {
+  const server = makeServer();
+  const base = await listenOn(server);
+
+  const body = await (await fetch(`${base}/api/lan`)).json();
+  assert.equal(body.managed, false);
+
+  const res = await fetch(`${base}/api/lan`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(res.status, 503);
+
+  server.close();
+});

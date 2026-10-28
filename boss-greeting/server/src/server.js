@@ -8,10 +8,10 @@ import { selectVariant, buildJdText } from './variantSelector.js';
 import {
   buildTemplateGreeting,
   buildProbePrompt,
-  callMessagesApi,
+  buildGreetingPrompt,
+  callChatApi,
   decideByPrompt,
-  pickSample,
-  buildGreetingSystemPrompt,
+  detectApiFormat,
 } from './evaluator.js';
 import { createLedger, toCsv } from './ledger.js';
 import { renderDashboardHtml } from './dashboard.js';
@@ -86,7 +86,7 @@ export function loadServerConfig(file) {
   if (lan && !token) {
     throw new Error(
       '服务配置开启了局域网访问(lan: true)但没有 token。\n' +
-      `请补上 ${target} 的 token 字段(或用 开机自启-安装.cmd 生成),否则拒绝启动。`,
+      `请补上 ${target} 的 token 字段(或把 lan 改成 false 只让本机访问),否则拒绝启动。`,
     );
   }
 
@@ -258,30 +258,24 @@ export async function evaluateJob(job, deps) {
   let greetingFallback = false;
 
   if (decision.apply) {
-    // 用户在「打招呼样式」里配了样例,就原样发那一条,**不经过模型**。
+    // 招呼语一律由模型写,不再有「回落到用户写的固定句子」这条路。
     //
-    // 模型拿简历自由发挥时,会把简历里没有的东西也写进句子 —— 示例简历那回就发过
-    // 「我是示例大学张三,技能方向是语言和工具」。样例是用户自己写、自己认的内容,
-    // 发出去的每个字都可控,比让模型润色更接近他想要的招呼语。
-    const sample = deps.pickGreetingSample ? deps.pickGreetingSample() : '';
-    if (sample) {
-      greeting = sample;
-    } else {
-      // 没配样式才退回 AI 生成(以及生成失败时的模板兜底)。
-      try {
-        const generated = await deps.buildGreeting(job, profile);
-        if (generated) {
-          greeting = generated;
-        } else {
-          greeting = buildTemplateGreeting(profile, job);
-          greetingFallback = true;
-        }
-      } catch {
-        // 判定已通过,只是措辞生成失败 —— 退回模板照常投。
-        // 这与判定失败不同:岗位本身是合适的,不该因为一句措辞丢掉。
-        greeting = buildTemplateGreeting(profile, job);
-        greetingFallback = true;
-      }
+    // 固定句子的好处是每个字都经过用户确认,代价是**跟岗位无关** —— 而一字不变地
+    // 连发几百遍正是账号被判群发的头号原因。现在「匹配不上时怎么自荐」也写成
+    // greetingPrompt 里的一句要求,由模型每次换个说法表达,自由度更高。
+    //
+    // 唯一的硬兜底是 buildTemplateGreeting:生成不可用时至少发一句出去。
+    // 判定已经通过,不该因为一句措辞把岗位丢掉。
+    try {
+      const generated = await deps.buildGreeting(job, profile);
+      if (generated) greeting = generated;
+    } catch {
+      // 措辞生成失败不该丢掉一个已判定要投的岗位 —— 落到下面的模板兜底。
+    }
+
+    if (!greeting) {
+      greeting = buildTemplateGreeting(profile, job);
+      greetingFallback = true;
     }
   }
 
@@ -298,26 +292,17 @@ export async function evaluateJob(job, deps) {
   };
 }
 
-// 生成招呼语:用 LLM 把简历事实和 JD 措辞对上。
+// 生成招呼语:简历事实(含实习/项目)+ 岗位 + JD,交给模型写一句。
 //
-// 只在用户**没配**「打招呼样式」时才会走到这里 —— 配了样式的话,evaluateJob 直接
-// 把那条样例原样发出去,不经过模型。失败返回空串,由调用方退回模板兜底。
-async function buildGreetingViaLlm(job, profile, options) {
-  const { callLlm } = options;
-  const system = buildGreetingSystemPrompt();
-
-  const user = [
-    `简历:${profile.name},${profile.sections.education[0]?.title || ''},技能方向:${profile.sections.skills.map((s) => s.label).join('、')}`,
-    `岗位:${job.jobName || ''} @ ${job.company || ''}`,
-    `JD:${(job.postDescription || '').slice(0, 800)}`,
-  ].join('\n');
-
-  const text = await callLlm(system, user);
-  return String(text || '').trim();
+// stylePrompt 是大屏「打招呼样式」里那段用户要求,只影响怎么写,不逐字发出。
+// 导出是为了能单测:它是「拼提示词 → 调模型」这条链唯一能被一次跑通的地方。
+export async function buildGreetingViaLlm(job, profile, options) {
+  const prompt = buildGreetingPrompt(profile, job, { stylePrompt: options.stylePrompt });
+  const text = await options.callLlm(prompt.system, prompt.user);
+  return String(text == null ? '' : text).trim();
 }
 
 export function createServer(options = {}) {
-  const deps = options.deps || buildDefaultDeps();
   // 运行数据落在服务目录的 data/ 下,不进 git。测试显式传 ledgerFile,
   // 避免把假记录写进真实文件、以及测试之间互相污染。
   const ledgerFile = options.ledgerFile || path.join(ROOT, 'data', 'jobs.jsonl');
@@ -327,11 +312,26 @@ export function createServer(options = {}) {
   const ledger = createLedger(ledgerFile);
   ledger.setRunId(runId);
 
-  // token 为空 = 不开鉴权(默认,与本机单机用法一致)。
-  // allowLoopback 默认 true:本机浏览器和油猴脚本都走 127.0.0.1,不带令牌也该放行。
-  // 它存在的意义是让测试能把豁免关掉,从而覆盖到鉴权分支。
-  const token = String(options.token || '').trim();
+  // 默认依赖不读流水(判定与招呼语只依赖配置和简历),注入 deps 的调用方(测试)
+  // 自带这些依赖,不走这条路。
+  const deps = options.deps || buildDefaultDeps();
+
+  // token 可以是函数:大屏上开关「手机看大屏」时令牌是现生成的,而 createServer
+  // 只在启动时建一次。传字符串的老用法(npm start / 测试)保持不变。
+  const tokenSource = options.token;
+  const currentToken = () =>
+    (typeof tokenSource === 'function' ? String(tokenSource() || '') : String(tokenSource || '')).trim();
   const allowLoopback = options.allowLoopback !== false;
+
+  // 判定服务由谁管。exe 起的控制进程会传进来一个控制器(可启动/停止后台判定服务);
+  // npm start 与测试不传 = 判定就在本进程里,和以前完全一样。
+  const serviceControl = options.serviceControl || null;
+  // 控制进程自己的退出入口。每次双击 exe 都由新实例调用它接管端口 —— 用户想要的是
+  // 「打开现在的 HelloBoss」,而不是复用可能已经跑了一整夜的旧实例。
+  // 只有 exe 的控制进程会传;npm start 与测试不传时这个接口明确回 503。
+  const shutdownControl = options.shutdownControl || null;
+  // 局域网开关。只有控制进程会传;命令行启动时这两个接口返回 503。
+  const lanControl = options.lanControl || null;
 
   // 谁在看大屏(见 src/idleExit.js)。不传 = 不记账,服务也不会自己退出,
   // 这是 npm start 与绝大多数测试的用法。
@@ -345,6 +345,8 @@ export function createServer(options = {}) {
       // 基址是占位符 —— 只用来把相对 URL 补全成可解析的绝对 URL,不会被请求。
       const parsed = new URL(req.url || '/', 'http://127.0.0.1');
       const pathname = parsed.pathname;
+      // 每个请求现取一次:大屏上刚开启局域网时,新生成的令牌要立刻生效。
+      const token = currentToken();
 
       // 带令牌访问一次看板 → 换 cookie 再跳到不带令牌的干净地址,免得令牌长期留在
       // 地址栏与历史记录里。这一步放在鉴权之前:本机(回环免令牌)走同一个地址也会被清干净。
@@ -380,10 +382,116 @@ export function createServer(options = {}) {
         const current = deps.settings ? deps.settings.get() : {};
         sendJson(res, 200, {
           ok: true,
-          profiles: deps.profiles.length,
+          profiles: deps.profileCount ? deps.profileCount() : deps.profiles.length,
           cache: cache.size,
           aiConfigured: Boolean(String(current.aiKey || '').trim()),
         });
+        return;
+      }
+
+      // ---- 判定服务的启停(只有 exe 起的控制进程才管得到) ----
+      //
+      // 大屏本身由控制进程提供,所以「服务停了」时页面照样能开、能看记录、能改配置。
+      // 被停掉的只是真正接 /evaluate 的那个后台进程。
+      const serviceStatus = () => (serviceControl
+        ? serviceControl.status()
+        : { managed: false, running: true, state: 'running' });
+
+      if (req.method === 'GET' && pathname === '/api/service') {
+        sendJson(res, 200, serviceStatus());
+        return;
+      }
+
+      if (req.method === 'POST' && (pathname === '/api/service/start' || pathname === '/api/service/stop')) {
+        if (isCrossOriginWrite(req.headers)) {
+          sendJson(res, 403, { error: '拒绝跨站写入' });
+          return;
+        }
+        // 页面统一用 POST JSON 提交;这里不读请求体,但要把它收掉,否则 keep-alive
+        // 连接上残留的请求体会被当成下一个请求的开头。
+        await readBody(req);
+
+        if (!serviceControl) {
+          sendJson(res, 503, { error: '当前是命令行启动,判定服务不由大屏管理' });
+          return;
+        }
+
+        const action = pathname.endsWith('/start') ? 'start' : 'stop';
+        try {
+          const next = await serviceControl[action]();
+          sendJson(res, 200, next);
+        } catch (error) {
+          // 起不来也要把当前状态带回去,页面据此把按钮恢复成「启动服务」。
+          sendJson(res, 500, { ...serviceStatus(), error: error.message });
+        }
+        return;
+      }
+
+      // ---- 旧实例退场:新一次双击 exe 时由引导层调用 ----
+      //
+      // 必须在响应发完之后再关服务:同步 shutdown 会把这根连接一起收掉,
+      // 调用方只会看到连接被重置,于是一直等到超时。
+      // 大屏页面上没有这个入口 —— 它只服务于「新实例接管端口」这一种场景。
+      if (req.method === 'POST' && pathname === '/api/shutdown') {
+        if (isCrossOriginWrite(req.headers)) {
+          sendJson(res, 403, { error: '拒绝跨站写入' });
+          return;
+        }
+        // 只有本机的引导层需要它。手机看大屏时可别让局域网里任何一台拿到令牌的设备
+        // 顺手把整个控制台停掉 —— 那是权限升级。
+        if (!isLoopbackAddress(req.socket.remoteAddress)) {
+          await readBody(req);
+          sendJson(res, 403, { error: '只允许从本机停止控制进程' });
+          return;
+        }
+        await readBody(req);
+
+        if (!shutdownControl) {
+          sendJson(res, 503, { error: '当前是命令行启动,没有可停止的控制进程' });
+          return;
+        }
+
+        res.once('finish', shutdownControl);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      // ---- 手机看大屏:开关局域网监听 ----
+      const lanStatus = () => (lanControl
+        ? lanControl.status()
+        : { managed: false, enabled: false, token: '', urls: [] });
+
+      if (req.method === 'GET' && pathname === '/api/lan') {
+        sendJson(res, 200, lanStatus());
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/lan') {
+        if (isCrossOriginWrite(req.headers)) {
+          sendJson(res, 403, { error: '拒绝跨站写入' });
+          return;
+        }
+        if (!lanControl) {
+          await readBody(req);
+          sendJson(res, 503, { error: '当前是命令行启动,局域网开关不由大屏管理' });
+          return;
+        }
+
+        const raw = await readBody(req);
+        let payload;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          sendJson(res, 400, { error: '请求体不是合法 JSON' });
+          return;
+        }
+
+        try {
+          const next = await lanControl.setEnabled(payload && payload.enabled === true);
+          sendJson(res, 200, next);
+        } catch (error) {
+          sendJson(res, 500, { ...lanStatus(), error: error.message });
+        }
         return;
       }
 
@@ -436,6 +544,17 @@ export function createServer(options = {}) {
           return;
         }
 
+        // 控制进程自己不判定:判定在后台服务进程里。服务没启动时明确回 503,
+        // 让脚本侧看到「服务未启动」而不是一个含糊的网络错误。
+        if (serviceControl) {
+          if (!serviceControl.isRunning()) {
+            sendJson(res, 503, { error: '判定服务未启动:请在大屏右上角点「启动服务」' });
+            return;
+          }
+          await serviceControl.forwardEvaluate(raw, res);
+          return;
+        }
+
         const key = jobSignature(job);
         if (cache.has(key)) {
           const hit = cache.get(key);
@@ -468,6 +587,8 @@ export function createServer(options = {}) {
           runId,
           seq: ledger.seq(),
           stats: ledger.stats(),
+          // 大字按钮的状态跟着同一个轮询走,页面不必再单独起一个定时器。
+          service: serviceStatus(),
           // 柱状图要的是**全量历史**,而 records 是增量的 —— 所以每天的分组由服务端算好
           // 一并返回,而不是让页面去拼增量。放同一个响应里还有个好处:图表和表格用的是
           // 同一次轮询的同一份数据,不会出现「表格更新了而图表还是上一轮」的错位。
@@ -515,13 +636,28 @@ export function createServer(options = {}) {
             return;
           }
 
-          // 判定结果按岗位签名缓存(prompt 影响 apply/reason,样例影响 greeting),
+          // 判定结果按岗位签名缓存(prompt 影响 apply/reason,招呼样式影响 greeting),
           // 配置一变已缓存的结论就过期了。不清的话用户改完重跑,看到的还是旧结论,
           // 会以为「改了没用」。清缓存不会导致重复投递:脚本侧有本地「已沟通」记录去重。
           cache.clear();
+          // 判定结果缓存在后台服务进程里,配置一变要让它也清掉 —— 否则用户改完规则
+          // 重跑,看到的还是旧结论。服务没启动时不用管:它启动时会重新读配置。
+          if (serviceControl) serviceControl.clearCache();
           sendJson(res, 200, { ok: true, settings: redactSettings(saved) });
           return;
         }
+      }
+
+      // 内部接口:控制进程保存配置后,让后台判定服务清掉自己的判定缓存。
+      // 走同一套跨站写入防护 —— 它虽然是本机调用,但没有理由比别的写接口更宽松。
+      if (req.method === 'POST' && pathname === '/api/cache/clear') {
+        if (isCrossOriginWrite(req.headers)) {
+          sendJson(res, 403, { error: '拒绝跨站写入' });
+          return;
+        }
+        cache.clear();
+        sendJson(res, 200, { ok: true });
+        return;
       }
 
       // 大屏「测试连通」:拿页面上当前填的端点/模型/密钥实际打一次上游,把结论回给页面。
@@ -568,14 +704,18 @@ export function createServer(options = {}) {
         }
 
         const startedAt = Date.now();
+        // 这次探测实际按哪种格式打的。格式是按端点 URL 自动识别的(见 evaluator.detectApiFormat),
+        // 用户填了个「路径不带 /messages 也不带 /chat/completions」的中转时,这是唯一能看出
+        // 判成了哪一种的地方 —— 连成功带失败一起回给大屏。
+        const format = detectApiFormat(config.endpoint);
         try {
           await deps.testAi(config);
-          // 响应体里只出结论与模型名。明文密钥绝不进响应体 —— 大屏可以带令牌对局域网开放。
-          sendJson(res, 200, { ok: true, ms: Date.now() - startedAt, model: config.model });
+          // 响应体里只出结论、格式与模型名。明文密钥绝不进响应体 —— 大屏可以带令牌对局域网开放。
+          sendJson(res, 200, { ok: true, ms: Date.now() - startedAt, model: config.model, format });
         } catch (error) {
           // 探测失败是「问到了上游、上游说不行」(密钥错 / 端点错 / 超时),不是调用本接口的
           // 方式错了,所以照回 200 —— 大屏只看 ok 决定红绿,不必再分辨 HTTP 状态。
-          sendJson(res, 200, { ok: false, ms: Date.now() - startedAt, error: error.message });
+          sendJson(res, 200, { ok: false, ms: Date.now() - startedAt, error: error.message, format });
         }
         return;
       }
@@ -651,12 +791,12 @@ function buildDefaultDeps() {
   const keywords = readJson(path.join(ROOT, 'config', 'keywords.json'));
   const byVariant = new Map(profiles.map((p) => [p.variant, p]));
 
-  // 大屏上可改的判定规则与招呼样例。放 data/ 下(已在 .gitignore),
-  // 免得个人的招呼样例被提交进仓库。
+  // 大屏上可改的判定规则与招呼样式。放 data/ 下(已在 .gitignore),
+  // 免得个人的招呼样式被提交进仓库。
   const settings = createSettingsStore(path.join(ROOT, 'data', 'settings.json'));
 
   // 每次调用都现取一次 —— 大屏上保存后立即生效,不必重启服务。
-  // 密钥为空时 callMessagesApi 直接抛错,判定与生成各自走既有的 fallback 分支。
+  // 密钥为空时 callChatApi 直接抛错,判定与生成各自走既有的 fallback 分支。
   const aiConfig = () => {
     const current = settings.get();
     return { endpoint: current.aiEndpoint, key: current.aiKey, model: current.aiModel };
@@ -666,6 +806,9 @@ function buildDefaultDeps() {
     profiles,
     keywords,
     settings,
+    // 大屏的简历警告条走这一项:每次现读一遍 resumes/,用户把简历放进去后不必
+    // 重启控制进程就能看到警告消失。判定服务启动时也会自己重新加载。
+    profileCount: () => loadProfiles(RESUME_SRC).length,
     profileOf: (variant) => byVariant.get(variant) || profiles[0],
     selectVariant,
     decideByPrompt: (job, profile, ruleText) =>
@@ -673,17 +816,17 @@ function buildDefaultDeps() {
         budgetMs: DECISION_BUDGET_MS,
         ai: aiConfig(),
       }),
-    // 配了招呼样式就原样发(在 evaluateJob 里直接返回,不调模型);没配才轮到下面的
-    // 生成。每次现取一次,大屏上改完立即生效,不必重启服务。
-    pickGreetingSample: () => pickSample(settings.get().greetingSamples),
     buildGreeting: (job, profile) =>
       buildGreetingViaLlm(job, profile, {
+        // 用户在大屏「打招呼样式」里写的那段要求。空串 = 没配,走通用要求。
+        // 每次现取一次设置,大屏上改完下一个岗位就生效。
+        stylePrompt: settings.get().greetingPrompt,
         // 生成也要有超时。没有上限的话,端点卡住时服务端会一直挂着,
         // 直到脚本侧 45 秒超时断开 —— 请求白做,还占着连接。
-        // 请求头、请求体、超时现在统一由 callMessagesApi 负责(与判定共用同一处),
+        // 请求头、请求体、超时现在统一由 callChatApi 负责(与判定共用同一处),
         // 这里不再另抄一份 fetch —— 抄一份就意味着加配置时要改两个地方。
         callLlm: (system, user) =>
-          callMessagesApi({
+          callChatApi({
             ...aiConfig(),
             system,
             user,
@@ -691,11 +834,11 @@ function buildDefaultDeps() {
             timeoutMs: GREETING_BUDGET_MS,
           }),
       }),
-    // 大屏「测试连通」用。与判定、招呼语共用 callMessagesApi 这一处调用 ——
+    // 大屏「测试连通」用。与判定、招呼语共用 callChatApi 这一处调用 ——
     // 请求头、请求体、超时都不另抄一份,否则加配置时要改两个地方。
     testAi: (config) => {
       const probe = buildProbePrompt();
-      return callMessagesApi({
+      return callChatApi({
         ...config,
         system: probe.system,
         user: probe.user,
@@ -722,11 +865,12 @@ export function lanAddresses() {
 /**
  * 启动服务并开始监听,返回 http.Server。
  *
- * 两个入口共用这一处:「node src/server.js」(以及 .cmd / .vbs)和打包出来的
- * HelloBoss.exe 的引导脚本。所以它只负责「起服务」,不管任何与启动方式有关的
- * 事(开浏览器、建快捷方式)—— 那些留给各自的入口。
+ * 这是「单进程」入口:`node src/server.js` 与 npm start 走这里,判定也在这个进程里。
+ * 打包出来的 HelloBoss.exe 不走它 —— 控制进程用 src/supervisor.js,判定服务用自己的
+ * 子进程入口(见 launcher/bootstrap.cjs)。把两种启动方式分开,是为了让「默认不启动
+ * 判定服务」成立,而不是在一个进程里假装停掉。
  *
- * 配置错误会抛出去而不是自己 process.exit:exe 那侧要先把错误写进日志、再弹窗
+ * 配置错误会抛出去而不是自己 process.exit:入口那侧要先把错误写进日志、再弹窗
  * 告诉用户,而不是当作「服务偷偷没起来」。
  *
  * @param {object} [options]
@@ -738,11 +882,9 @@ export function startServer(options = {}) {
   // 「页面关了自动退出」这条路径的用例就会随本机状态时灵时不灵。
   const serverConfig = loadServerConfig(process.env.SERVER_CONFIG || undefined);
 
-  // 「大屏页面关掉就把服务停掉」只在走「双击 打开大屏.vbs / HelloBoss.exe」
-  // 这条路径时生效 —— 启动服务.cmd 会设这个变量。两种情况下不生效:
-  //   npm start:开发调试用法,页面关了它还得继续跑;
-  //   对局域网开放:那时服务是给整个局域网用的,不该由某一个标签页决定生死
-  //   (否则手机上随手关掉大屏,正在跑脚本的那台机器就没了判定服务)。
+  // 「大屏页面关掉就把服务停掉」只给 npm 开发路径与自动退出测试用。
+  // HelloBoss.exe 的控制进程自己管理空闲退出(见 src/supervisor.js),不走这里。
+  // 局域网模式下也不该由某一个标签页决定生死:那时服务是给整个局域网用的。
   const exitWhenIdle = (options.exitWhenIdle ?? process.env.BOSS_EXIT_WHEN_IDLE === '1')
     && !serverConfig.lan;
 
@@ -798,8 +940,8 @@ export function startServer(options = {}) {
   return server;
 }
 
-// 直接用 node src/server.js 启动时才监听;被测试 import、或者被 exe 的引导脚本
-// import 时都不走这里(后者自己调 startServer,并且要额外开浏览器)。
+// 直接用 node src/server.js 启动时才监听;被测试 import、或被 exe 的引导脚本
+// import 时都不走这里(后者只取 createServer,自己决定监听哪个端口)。
 if (process.argv[1] && process.argv[1].endsWith('server.js')) {
   try {
     startServer();

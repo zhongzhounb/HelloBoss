@@ -6,7 +6,7 @@
 // 只用 Node 内置模块。唯一的外部工具是 postject,由 npx 现下现用:所以「打包」这一步
 // 需要联网,而打出来的 exe 运行起来不需要任何东西。仓库运行期仍是零依赖。
 //
-// 用法:node launcher/build.mjs      (或双击上层目录的 打包exe.cmd)
+// 用法:node launcher/build.mjs      (不需要再跑任何 .cmd 脚本)
 import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,10 +35,21 @@ function runShell(commandLine) {
   execSync(commandLine, { stdio: 'inherit' });
 }
 
-fs.rmSync(DIST, { recursive: true, force: true });
+// 只清掉上一次的代码与产物,**保留** dist/data、dist/config/server.json 和
+// dist/resumes 里的用户文件。它们是用户的配置、局域网令牌、简历和流水 ——
+// 不是构建产物。以前整目录 rmSync 会在重新打包时把这些一起删掉,那是不可恢复的。
 fs.rmSync(WORK, { recursive: true, force: true });
 fs.mkdirSync(DIST, { recursive: true });
 fs.mkdirSync(WORK, { recursive: true });
+for (const name of [
+  'src',
+  'HelloBoss.exe',
+  'package.json',
+  '使用说明.txt',
+  'zhipin-auto-greeting.user.js',
+]) {
+  fs.rmSync(path.join(DIST, name), { recursive: true, force: true });
+}
 
 // 1) 把引导层打成 SEA blob
 const blob = path.join(WORK, 'sea-prep.blob');
@@ -59,6 +70,9 @@ runShell(`npx --yes ${POSTJECT} "${EXE}" NODE_SEA_BLOB "${blob}" --sentinel-fuse
 // 3) 组装目录。只放别人跑起来需要的东西:自己的简历不进包(那是个人信息),
 //    config/server.json 也不进(局域网令牌是本机的)。data/ 由服务自己建。
 fs.cpSync(path.join(SERVER_DIR, 'src'), path.join(DIST, 'src'), { recursive: true });
+// package.json 里只有 "type": "module" 这一项是运行期需要的:src/ 下的 .js 靠它
+// 才会被 Node 当成 ESM。少了它,dynamic import 会按 CommonJS 解析,exe 一启动就报错。
+fs.copyFileSync(path.join(SERVER_DIR, 'package.json'), path.join(DIST, 'package.json'));
 fs.mkdirSync(path.join(DIST, 'config'), { recursive: true });
 fs.copyFileSync(path.join(SERVER_DIR, 'config', 'keywords.json'), path.join(DIST, 'config', 'keywords.json'));
 fs.mkdirSync(path.join(DIST, 'resumes'), { recursive: true });
@@ -77,3 +91,6 @@ fs.writeFileSync(path.join(DIST, '使用说明.txt'), Buffer.concat([
 console.log('');
 console.log(`[打包完成] ${DIST}`);
 console.log('  把整个 dist 文件夹压成 zip 发出去,对方解压后双击 HelloBoss.exe 即可。');
+console.log('  exe 只负责控制台与开关;判定服务由大屏右上角的按钮启停。');
+console.log('  注意:dist/data、dist/config/server.json、dist/resumes 里的个人内容不会被打包脚本清掉;');
+console.log('  要发给别人,先手动删掉这些文件(或者只压缩 exe、src、config/keywords.json、resumes/example.txt、使用说明.txt、油猴脚本)。');

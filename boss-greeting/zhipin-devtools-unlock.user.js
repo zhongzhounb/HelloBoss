@@ -704,9 +704,6 @@
     patchedConsoles.add(consoleObject);
     const realmName = options && options.realmName || 'unknown';
 
-    const originalDebug = typeof consoleObject.debug === 'function'
-      ? consoleObject.debug.bind(consoleObject)
-      : function () {};
     const originalClear = typeof consoleObject.clear === 'function'
       ? consoleObject.clear
       : function () {};
