@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HelloBoss · BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.2.0
+// @version      0.3.0
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -38,7 +38,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.2.0',
+    version: '0.3.0',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
