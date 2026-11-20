@@ -3,6 +3,31 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { renderDashboardHtml } from '../src/dashboard.js';
 
+// 从整页 HTML 里截出一段带某个特征的元素及其内容(含嵌套同名标签)。
+// 分页之后「某块只在设置页 / 只在投递页」是要守住的性质,而两个页面容器里都嵌着
+// 若干 <section class="panel"> —— 用正则找第一个 </section> 会在第一个面板处截断。
+// 这里按标签深度配平,只依赖零依赖的字符串扫描。
+function sliceTag(html, tag, marker) {
+  let start = -1;
+  for (let at = html.indexOf('<' + tag, 0); at >= 0; at = html.indexOf('<' + tag, at + 1)) {
+    const close = html.indexOf('>', at);
+    const head = html.slice(at, close + 1);
+    // 找的是「开头标签里带这个特征」的那一个,且不能是自闭合。
+    if (head.includes(marker) && !head.endsWith('/>')) { start = at; break; }
+  }
+  assert.ok(start >= 0, `页面里找不到 ${tag} ${marker}`);
+
+  const pattern = new RegExp(`<(/?)${tag}(?:\\s[^>]*)?>`, 'g');
+  pattern.lastIndex = start;
+  let depth = 0;
+  let match;
+  while ((match = pattern.exec(html))) {
+    depth += match[1] ? -1 : 1;
+    if (depth === 0) return html.slice(start, pattern.lastIndex);
+  }
+  assert.fail(`${tag} ${marker} 没有闭合`);
+}
+
 test('返回一个完整的 HTML 文档', () => {
   const html = renderDashboardHtml();
   assert.match(html, /^<!DOCTYPE html>/i);
@@ -58,15 +83,16 @@ test('投递数量与时段不再出现在服务端配置里', () => {
   assert.ok(!html.includes('投递时段'), '时段面板应已删除');
 });
 
-test('顶部有标题栏、服务开关与手机访问按钮', () => {
+test('顶部有标题栏与服务开关,且不再有手机看大屏', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes('HelloBoss'), '标题栏应写「HelloBoss」');
   assert.ok(html.includes('id="svcBtn"'));
   // 控制台默认不启动判定服务,按钮一开始就该是「启动服务」。
   assert.match(html, /id="svcBtn"[^>]*>启动服务</, '按钮初始文案应为「启动服务」');
-  assert.ok(html.includes('id="lanBtn"'), '手机看大屏要能在页面里开关');
   assert.ok(html.includes('id="ctrlStatus"'), '启停失败要有地方显示原因');
-  assert.ok(html.includes('id="lanInfo"'), '开启手机访问后要显示地址');
+  // 手机看大屏(局域网监听)已整套移除,页面上不该再留入口。
+  assert.ok(!html.includes('id="lanBtn"'), '不该再有手机看大屏按钮');
+  assert.ok(!html.includes('/api/lan'), '不该再请求局域网接口');
 });
 
 test('打招呼判定是「编辑 / 保存」双态', () => {
@@ -113,6 +139,90 @@ test('下半屏也用面板框住', () => {
   assert.match(html, /class="bottom panel"/, '下半部分应当也是 panel,才有边框');
 });
 
+// ---- 两页结构:设置 / 投递记录 ----
+//
+// 一屏塞四栏时,新用户分不清「要先配什么」和「投递结果在哪」。
+// 两页的分工要能一眼看出来,且配置与记录各自归位。
+
+test('页面分成「设置」「投递记录」两页,且一次只显示一页', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="viewSettings"'), '要有设置页容器');
+  assert.ok(html.includes('id="viewDelivery"'), '要有投递记录页容器');
+  assert.ok(html.includes('data-view="settings"'), '要有切页按钮');
+  assert.ok(html.includes('data-view="delivery"'));
+  assert.ok(html.includes('function switchView'), '切页要由一个函数统一处理');
+  // 两页靠 .active 互斥显示 —— 如果两个容器同时可见,就等于没分页。
+  assert.ok(html.includes(".view.active { display: grid;"), '只有 active 的那个页面可见');
+});
+
+test('设置页放规则、样式和 AI 接入;投递页放柱状图与记录表', () => {
+  const html = renderDashboardHtml();
+  const settings = sliceTag(html, 'section', 'id="viewSettings"');
+  const delivery = sliceTag(html, 'section', 'id="viewDelivery"');
+
+  for (const label of ['打招呼判定', '打招呼样式', 'AI 接入']) {
+    assert.ok(settings.includes(label), `设置页应有「${label}」`);
+  }
+  assert.ok(settings.includes('id="decisionPrompt"'));
+  assert.ok(settings.includes('id="greetingPrompt"'));
+  assert.ok(settings.includes('id="aiEndpoint"'));
+
+  assert.ok(delivery.includes('id="chart"'), '投递页要有柱状图');
+  assert.ok(delivery.includes('id="rows"'), '投递页要有记录表');
+  assert.ok(delivery.includes('id="stats"'), '投递页要有统计数字');
+  // 配置项不该出现在投递页:两个页面都能配的话,「设置页」这个分工就没了。
+  assert.ok(!delivery.includes('id="decisionPrompt"'), '投递页不该再摆一份规则框');
+  assert.ok(!delivery.includes('id="aiKey"'), '投递页不该再摆一份密钥框');
+});
+
+test('投递页是左右布局:左边柱状图,右边记录表', () => {
+  const html = renderDashboardHtml();
+  // 上下布局时垂直空间被图吃掉,记录表只剩几行;左右分栏后表能吃掉整列高度。
+  assert.match(html, /#viewDelivery \{[^}]*grid-template-columns:\s*minmax/,
+    '投递页应是两列网格');
+  assert.doesNotMatch(html, /#viewDelivery \{[^}]*grid-template-rows: auto minmax\(0, 1fr\)/,
+    '不该再是「上面图、下面表」的上下布局');
+  // 图表所在的那栏占满整列高度,否则固定高度的图会在面板里留一大片空白。
+  assert.ok(html.includes('.chart { display: flex; flex: 1;'), '图表应吃掉剩余高度');
+});
+
+test('默认落在设置页,上次停在投递页时能记住', () => {
+  const html = renderDashboardHtml();
+  // 一进来就该看到「要先配什么」;没配过的人不会想在空记录页上待着。
+  assert.ok(html.includes("return localStorage.getItem(VIEW_KEY) === 'delivery' ? 'delivery' : 'settings';"),
+    '默认应是设置页');
+  // 避免每刷新一次都跳回设置页 —— 大屏常开着瞄记录。
+  assert.ok(html.includes('switchView(initialView());'), '启动时按记忆的页面渲染');
+  // localStorage 在部分浏览器策略下会直接抛,不能让它把整段脚本带崩。
+  assert.ok(html.includes('try {'), '读写 localStorage 要兜住异常');
+});
+
+test('切到投递页时把记录表滚到底', () => {
+  const html = renderDashboardHtml();
+  // 隐藏期间新记录已经追加进来,但 display:none 时 scrollHeight 是 0 ——
+  // 只能在切回来的那一刻补一次滚动,否则看到的是一天前的第一条。
+  assert.ok(html.includes("if (delivery) tableWrapEl.scrollTop = tableWrapEl.scrollHeight;"),
+    '切页后要贴底');
+});
+
+test('红条留在标题栏,两页都看得到', () => {
+  const html = renderDashboardHtml();
+  const head = sliceTag(html, 'div', 'class="head"');
+  // 「不会投递任何岗位」是整页后果,不该只在设置页提示 ——
+  // 用户盯着投递页纳闷为什么没记录时,得能直接看到原因。
+  assert.ok(head.includes('id="ruleWarn"'), '规则警告条应在标题栏');
+  assert.ok(head.includes('id="knowledgeWarn"'), '知识库警告条应在标题栏');
+});
+
+test('轮询与 watch 连接不随切页重建', () => {
+  const html = renderDashboardHtml();
+  // 两页共用一个轮询和一条 SSE;每页各自维护一套会让游标与服务灯重复、也可能双插记录。
+  const polls = html.match(/setInterval\(poll/g) || [];
+  assert.equal(polls.length, 1, `轮询只该有一处,实际 ${polls.length} 处`);
+  const watches = html.match(/new EventSource/g) || [];
+  assert.equal(watches.length, 1, `watch 连接只该挂在 openWatch 里`);
+});
+
 test('记录表的时间列带日期,并按日期+时间排序后只留最近 100 条', () => {
   const html = renderDashboardHtml();
   // 跨天挂机时只有时分秒会让昨天的记录和今天的分不开。
@@ -135,9 +245,13 @@ test('配置面板读写 /api/settings,且只在启动时读一次', () => {
   assert.ok(html.includes('/api/settings'), '配置面板要能读也要能写');
   assert.ok(html.includes("method: 'POST'"), '保存要走 POST');
   // 配置只在加载时拉一次。进了轮询循环的话,用户正在输入的草稿会被服务端的旧值覆盖。
-  // 只数带分号的调用 —— 函数声明 `function loadSettings() {` 也含这个名字,不排除它会多数一次。
-  const loads = html.match(/loadSettings\(\);/g) || [];
-  assert.equal(loads.length, 1, `loadSettings 应只在启动时调用一次,实际 ${loads.length} 次`);
+  //
+  // 数的是「调用」而不是某种固定写法:首屏教学那边写的是
+  // `loadSettings().then(maybeAskTour)`,后面接什么方法不该让这条断言失效。
+  // 函数声明 `function loadSettings() {` 不当成调用。
+  const calls = [...html.matchAll(/loadSettings\s*\(\s*\)/g)];
+  const invocations = calls.filter((m) => !/function\s+$/.test(html.slice(0, m.index)));
+  assert.equal(invocations.length, 1, `loadSettings 应只在启动时调用一次,实际 ${invocations.length} 次`);
 });
 
 test('柱状图是纯 CSS 实现的,没有引入图表库', () => {
@@ -212,14 +326,14 @@ test('配置加载后回填端点与模型，并刷新密钥提示', () => {
   assert.ok(html.includes('setKeyHint(data.hasAiKey'), '加载后要刷新「已配置 / 未配置」提示');
 });
 
-test('没加载到简历时有单独的警告条，依据是 /health 的 profiles', () => {
+test('知识库为空时有单独的警告条，依据是 /health 的 hasKnowledge', () => {
   const html = renderDashboardHtml();
-  assert.ok(html.includes('id="profileWarn"'), '要有专门的简历警告条元素');
-  assert.ok(html.includes('没加载到简历'), '要说清后果,不能只在某个角落显示一个 0');
-  assert.ok(html.includes('resumes/'), '要告诉用户去哪儿放简历,否则只知道「没投」不知道怎么办');
+  assert.ok(html.includes('id="knowledgeWarn"'), '要有专门的知识库警告条元素');
+  assert.ok(html.includes('知识库还是空的'), '要说清后果,不能只在某个角落显示一个 0');
+  assert.ok(html.includes('粘进'), '要告诉用户去哪儿填知识库,否则只知道「没投」不知道怎么办');
   // 判断依据必须接在健康检查的结果上。规则警告条看的是 settings,两者不同源 ——
-  // 混用会让「有规则但没简历」这种情况一条提示都不出。
-  assert.ok(html.includes('health.profiles === 0'), '警告条的显示条件要接在 /health 的结果上');
+  // 混用会让「有规则但没知识库」这种情况一条提示都不出。
+  assert.ok(html.includes('health.hasKnowledge === false'), '警告条的显示条件要接在 /health 的结果上');
 });
 
 test('大屏挂一条长连接给控制进程当「有人在看」的信号', () => {
@@ -239,11 +353,17 @@ test('服务开关的状态跟着 /api/records 的 service 字段走', () => {
   assert.doesNotMatch(html, /svcState/, '不该再有旧的连接状态变量');
 });
 
-test('手机看大屏由页面开关,不再依赖单独的 .cmd 脚本', () => {
+test('知识库是设置页的一部分，和打招呼样式挨着', () => {
   const html = renderDashboardHtml();
-  assert.ok(html.includes("fetch('/api/lan')"), '加载时要读当前局域网状态');
-  assert.ok(html.includes("postJson('/api/lan'"), '开关要走 /api/lan');
-  assert.ok(html.includes('关闭手机访问'), '开着时按钮要能关掉');
+  const settings = html.slice(html.indexOf('id="viewSettings"'), html.indexOf('id="viewDelivery"'));
+  assert.ok(settings.includes('id="knowledge"'), '设置页要有知识库文本框');
+  assert.ok(settings.includes('id="btnKnowledgeSave"'), '知识库要能单独保存');
+  // 知识库排在打招呼样式之后 —— 「怎么写」在上、「写什么」在下,是这一页的分工。
+  const styleAt = settings.indexOf('id="greetingPrompt"');
+  const knowledgeAt = settings.indexOf('id="knowledge"');
+  assert.ok(styleAt > 0 && knowledgeAt > styleAt, '知识库应排在打招呼样式下面');
+  // 保存走同一套 settings 接口。
+  assert.ok(html.includes('postSettings({ knowledge: knowledgeEl.value })'), '知识库保存要走 /api/settings');
 });
 
 test('页面上写清了「控制台跟着本页,关掉就停」', () => {
@@ -319,4 +439,73 @@ test('内联脚本能编译 —— 外层模板字符串的转义错误在这里
   // 把字符串字面量切成两行。模板本身完全合法，测试不改的话页面表现为
   // 「整页 JS 全不执行」—— 按钮全没反应，控制台一行红字。要写 \\n。
   assert.doesNotThrow(() => new vm.Script(script), '内联脚本必须语法合法');
+});
+
+test('顶栏有「安装油猴脚本」的链接,且是指向 .user.js 的真链接', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="installScript"'), '要有安装脚本的入口');
+
+  // 必须是 <a href="…user.js"> —— 篡改猴靠「导航到一个 .user.js 地址」触发安装框,
+  // 换成按钮 + fetch 拼 blob 就不会弹安装页,用户只会下载到一个看不懂的文本文件。
+  const link = html.match(/<a[^>]+id="installScript"[^>]*>/);
+  assert.ok(link, '安装入口要是一个 <a> 标签');
+  assert.match(link[0], /href="\/install\.user\.js"/, '要指向服务的安装路径');
+});
+
+// ---- 首次使用教学 ----
+//
+// 新人最常见的卡点不是「不会填」,而是「不知道该去哪填、装没装上」。所以首屏问一句
+// 要不要教,要的话按顺序指到每一块该动的地方。
+
+test('首屏会问要不要开启使用教学,并且能选择跳过', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="tourAsk"'), '要有「要不要开启教学」的对话框');
+  assert.ok(html.includes('id="tourAccept"'), '要有「开启教学」');
+  assert.ok(html.includes('id="tourDecline"'), '要能选择不教 —— 不强迫');
+  // 默认隐藏:HTML 里不能一上来就显示,否则脚本没跑起来也挡着页面。
+  assert.match(html, /<div class="tour-ask" id="tourAsk" hidden>/, '询问框默认应隐藏');
+});
+
+test('顶栏有「使用教学」入口,看完还能重新打开', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="btnTour"'), '要有重新打开教学的按钮');
+});
+
+test('教学里每一步指向的 id 都真的存在于页面', () => {
+  const html = renderDashboardHtml();
+  const [script] = html.match(/<script>([\s\S]*?)<\/script>/).slice(1);
+  const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+
+  // 从 TOUR_STEPS 里抠出所有 target:'xxx'。target 为空串表示「居中卡片、不指位置」。
+  // 这里用整段匹配而不是逐行,是因为步骤表本身就是多行的。
+  const stepsBlock = script.slice(script.indexOf('var TOUR_STEPS'), script.indexOf('var tourIndex'));
+  assert.ok(stepsBlock.length > 0, '没有找到 TOUR_STEPS');
+
+  const targets = [...stepsBlock.matchAll(/target:\s*'([^']*)'/g)].map((m) => m[1]);
+  assert.ok(targets.length >= 5, '教学步骤太少,覆盖不到完整流程');
+
+  const missing = targets.filter((t) => t && !ids.has(t));
+  // 写错一个 id 不会报错,只会让那一步悄悄变成「居中卡片、什么都不指」——
+  // 用户看到的就是「说要点这里,但没说哪里」。
+  assert.deepEqual(missing, [], `这些教学目标在页面上不存在:${missing.join(', ')}`);
+});
+
+test('教学会记住「看过了」,不会每次都拦人', () => {
+  const html = renderDashboardHtml();
+  const [script] = html.match(/<script>([\s\S]*?)<\/script>/).slice(1);
+  assert.ok(script.includes('localStorage.setItem(TOUR_KEY'), '看完要落一个标记');
+  assert.ok(script.includes('localStorage.getItem(TOUR_KEY)'), '再次打开要先查这个标记');
+});
+
+test('教学内容点到了最关键的三件事:装脚本、填三项、启动服务', () => {
+  const html = renderDashboardHtml();
+  const [script] = html.match(/<script>([\s\S]*?)<\/script>/).slice(1);
+  const stepsBlock = script.slice(script.indexOf('var TOUR_STEPS'), script.indexOf('var tourIndex'));
+
+  // 只检查「有没有讲到」,不校验措辞 —— 文案以后会改,但这几件事不能漏。
+  for (const keyword of ['篡改猴', '安装油猴脚本', 'AI 接入', '投递规则', '知识库', '启动']) {
+    assert.ok(stepsBlock.includes(keyword), `教学里应提到「${keyword}」`);
+  }
+  // 必须说清「问候语来源保持 AI 判定」—— 换成别的模式就不看规则了。
+  assert.ok(stepsBlock.includes('AI 判定'), '要提醒保持 AI 判定模式');
 });

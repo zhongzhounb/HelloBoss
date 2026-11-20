@@ -1,5 +1,8 @@
 // 看板页面。纯原生 HTML/CSS/JS —— 不引任何外部资源,因为本项目约定零依赖,
 // 而这个页面要在无外网的本地环境里也能正常打开。
+//
+// 整页分两页(设置 / 投递记录),用两组 DOM 互斥显示,不是两条路由 ——
+// 理由见内联脚本「两个页面」那一节。
 export function renderDashboardHtml(options = {}) {
   const pollMs = Number(options.pollMs) > 0 ? Math.floor(Number(options.pollMs)) : 1500;
   const maxRows = Number(options.maxRows) > 0 ? Math.floor(Number(options.maxRows)) : 100;
@@ -17,11 +20,12 @@ export function renderDashboardHtml(options = {}) {
   body { margin: 0; background: #0d1117; color: #e6edf3;
          font: 13px/1.5 "Microsoft YaHei", "PingFang SC", sans-serif; }
 
-  /* 整页三段:标题栏 / 上半(三个等宽面板) / 下半(记录表)。
+  /* 整页两段:标题栏(含分页标签) / 视图区。
+     视图区里两个页面互斥:一页放配置,一页放柱状图和记录表。
      用 minmax(0, 1fr) 而不是 1fr —— 默认的 min-height:auto 会让表格把行撑开,
      整页跟着长高,下半就永远不出滚动条。 */
-  .screen { display: grid; grid-template-rows: auto auto minmax(0, 1fr);
-            gap: 12px; padding: 12px; height: 100%; }
+  .screen { display: flex; flex-direction: column; gap: 12px;
+            padding: 12px; height: 100%; }
 
   /* ---- 标题栏 ---- */
   .head { display: flex; flex-direction: column; gap: 8px; }
@@ -30,14 +34,22 @@ export function renderDashboardHtml(options = {}) {
             border: 1px solid #30363d; border-radius: 8px; }
   .topbar h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .5px; }
 
-  /* 没配规则 / 没放简历时的警告条。刻意做成整条通栏 + 红底,而不是靠面板上的一行小字 ——
+  /* ---- 分页标签 ---- */
+  /* 两页的分工要写在这里:一进来就能看出「先去左边配,配完去右边看」。 */
+  .tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tabs .hint { margin: 0 0 0 auto; }
+  .tab { background: transparent; color: #8b949e; padding: 7px 16px; font-size: 13px; }
+  .tab:hover { background: #21262d; color: #e6edf3; }
+  .tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+
+  /* 没配规则 / 没填知识库时的警告条。刻意做成整条通栏 + 红底,而不是靠面板上的一行小字 ——
      「当前不会投递任何岗位」这件事如果只体现为一个 0,用户会去查脚本、查网络,
-     而真正的原因是这里没填。 */
-  #ruleWarn, #profileWarn { display: none; padding: 10px 16px; border-radius: 8px;
+     而真正的原因是这里没填。两条放在标题栏里,两页都能看到:投递页看到「没投」时,
+     不该只有切回设置页才知道为什么。 */
+  #ruleWarn, #knowledgeWarn { display: none; padding: 10px 16px; border-radius: 8px;
               background: #2d1416; border: 1px solid #6e2b28; color: #ff9b95; font-size: 12px; }
-  #ruleWarn.show, #profileWarn.show { display: block; }
-  #ruleWarn strong, #profileWarn strong { color: #ff7b72; }
-  #profileWarn { margin-top: 6px; }
+  #ruleWarn.show, #knowledgeWarn.show { display: block; }
+  #ruleWarn strong, #knowledgeWarn strong { color: #ff7b72; }
 
   #svcBtn { min-width: 92px; }
   /* 状态灯:启动中(灰) / 运行中(绿) / 未连接(红)。三个状态的颜色本身就是信息,
@@ -45,22 +57,41 @@ export function renderDashboardHtml(options = {}) {
   #svcBtn.up { border-color: #238636; color: #3fb950; background: #12261a; }
   #svcBtn.down { border-color: #6e2b28; color: #f85149; background: #2d1416; }
 
+  /* 「安装油猴脚本」做成链接而不是按钮:篡改猴只认「导航到一个 .user.js 地址」这一种
+     安装触发方式,所以必须是 <a href> 而不是 fetch 完再拼 blob。
+     样式上跟旁边的按钮齐平,免得看起来像个不起眼的脚注。 */
+  #installScript { display: inline-block; padding: 6px 12px; border: 1px solid #30363d;
+                   border-radius: 6px; background: #21262d; color: #e6edf3;
+                   font-size: 12px; text-decoration: none; white-space: nowrap; }
+  #installScript:hover { background: #30363d; }
+
   /* 顶栏里那行说明:也是次要文字,但在 flex 行里要换成「把剩余空间吃掉」的左外边距,
      好让它和状态灯一起靠右,同时抵掉 .hint 自带的下外边距(否则会比按钮低一点点)。 */
   .topbar .hint { margin: 0 0 0 auto; }
   /* 启停失败的报错可能很长,别让它把顶栏撑开。 */
   #ctrlStatus { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* 手机看大屏的地址条:令牌很长,必须允许断行,否则会把页面撑出横向滚动。 */
-  .lan-info { display: none; padding: 9px 16px; border-radius: 8px;
-              background: #0d1b2a; border: 1px solid #1f6feb66; color: #8b949e;
-              font-size: 11px; line-height: 1.7; word-break: break-all; }
-  .lan-info.show { display: block; }
-  .lan-info a { color: #58a6ff; }
-
-  /* ---- 上半:四个面板等宽 ---- */
-  .top { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
-         gap: 12px; height: 300px; min-height: 0; }
+  /* ---- 视图区:两个页面互斥 ---- */
+  .view { display: none; flex: 1; min-height: 0; }
+  .view.active { display: grid; gap: 12px; }
+  /* 设置页:三栏等宽,规则 / (样式 + 知识库) / AI 接入。
+     行必须写成 minmax(0, 1fr) 而不是默认的 auto:auto 行的高度由内容撑,
+     而 textarea 是 flex:1、内容为空时几乎没有自然高度,三块面板会缩成一条。
+     让这一行吃掉视图区的全部高度,再靠面板内部的 flex 把文本框拉开。 */
+  #viewSettings { grid-template-columns: repeat(3, minmax(0, 1fr));
+                  grid-template-rows: minmax(0, 1fr); }
+  /* 中间栏上下两块:打招呼样式在上,它下面的知识库在下。
+     两块都要 flex 撑满整栏:只按内容高度排的话,下面会空出一大截白,
+     而知识库这个最需要空间的文本框反而最短。知识库给得比样式更宽裕 ——
+     它才是每投一次都要被读的那份资料。 */
+  .col { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+  .col > .panel { flex: 1 1 0; min-height: 0; }
+  .col > .panel:last-child { flex-grow: 1.6; }
+  /* 投递页:左边柱状图、右边记录表。
+     两列的比例按「记录表要能放下九列」来定 —— 表可以横向滚动,但图一旦窄到
+     柱子挤在一起就彻底没法看,所以图那一栏给三分之一多一点的固定份额。 */
+  #viewDelivery { grid-template-columns: minmax(280px, 5fr) minmax(0, 8fr);
+                  grid-template-rows: minmax(0, 1fr); }
 
   .panel { display: flex; flex-direction: column; min-height: 0;
            background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; }
@@ -68,7 +99,7 @@ export function renderDashboardHtml(options = {}) {
   .hint { margin: 0 0 7px; font-size: 11px; color: #6e7681; }
   /* 筛选倍数:这张图最该被一眼看到的数,所以单独占一行、字号明显大于正文,用「已投递」
      同款绿色。tabular-nums 让数字位数变化时不左右跳动。 */
-  .ratio { margin: 0 0 6px; font-size: 20px; font-weight: 700; color: #3fb950;
+  .ratio { margin: 0; font-size: 22px; font-weight: 700; color: #3fb950;
            font-variant-numeric: tabular-nums; }
 
   textarea { flex: 1; width: 100%; min-height: 0; resize: none; background: #0d1117;
@@ -86,8 +117,8 @@ export function renderDashboardHtml(options = {}) {
   .status.bad { color: #f85149; }
 
   /* ---- AI 接入 ---- */
-  /* 字段装在可滚动容器里:窄屏折成单列时面板高度是固定的,纯靠 flex 会把
-     最下面那个输入框挤没。 */
+  /* 字段装在可滚动容器里:窄屏折成单列时,固定高度的面板会靠 flex 把
+     最下面那个输入框挤没,所以它自己滚。 */
   .ai-fields { flex: 1; min-height: 0; overflow-y: auto; }
   .field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
   .field label { font-size: 11px; color: #8b949e; }
@@ -97,27 +128,37 @@ export function renderDashboardHtml(options = {}) {
   .field input::placeholder { color: #4d5560; }
 
   /* ---- 柱状图 ---- */
-  .chart { flex: 1; display: flex; align-items: flex-end; gap: 3px;
-           min-height: 0; overflow-x: auto; }
-  .day { flex: 1 1 0; min-width: 26px; display: flex; flex-direction: column;
-         align-items: center; gap: 5px; }
-  .bars { display: flex; align-items: flex-end; gap: 2px; height: 122px; }
-  /* 每根柱子包一列:数字标签在上、柱体在下,两者贴在一起。柱高按 .barcol 的
-     122px 算百分比,所以这里必须是确定高度,百分比才成立。 */
+  /* 左右布局下这一栏有整列的高度可用,图就跟着长高 —— 固定 170px 会在面板里
+     留一大片空白。柱高按 .bars 的百分比算,所以 .bars 也一起吃掉剩余高度。 */
+  .chart-panel { gap: 0; }
+  .chart-head { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+                margin-bottom: 10px; }
+  .chart { display: flex; flex: 1; align-items: flex-end; gap: 8px; min-height: 140px;
+           overflow-x: auto; }
+  /* 每天一列,用 grid 而不是 flex 竖排:柱高是按 .bars 的百分比算的,
+     而百分比只在父元素高度确定时才成立。grid 的 1fr 行会给出确定高度,
+     flex 纵向布局里 .bars 的高度只是「内容撑出来的」,柱高会全部塌成 0。 */
+  .day { flex: 1 1 0; min-width: 52px; max-width: 130px; height: 100%;
+         display: grid; grid-template-rows: minmax(0, 1fr) auto;
+         justify-items: center; align-items: end; gap: 5px; }
+  .bars { display: flex; align-items: flex-end; justify-content: center; gap: 4px;
+          width: 100%; height: 100%; min-height: 0; }
+  /* 每根柱子包一列:数字标签在上、柱体在下,两者贴在一起。柱高按 .bars 的
+     132px 算百分比,所以这里必须是确定高度,百分比才成立。 */
   .barcol { display: flex; flex-direction: column; align-items: center;
             justify-content: flex-end; height: 100%; }
   .bar-val { flex: none; font-size: 10px; line-height: 13px;
              font-variant-numeric: tabular-nums; color: #6e7681; }
   .bar-val.ok { color: #3fb950; }
   .bar-val.no { color: #8b949e; }
-  .bar { width: 9px; border-radius: 2px 2px 0 0; }
+  .bar { width: 16px; border-radius: 2px 2px 0 0; }
   /* 高度为 0 的柱子真会消失,而「这天跑过但一条都没成」和「这天没跑」在图上
      必须看得出来 —— 由 JS 给非零值兜一个最小高度,这里只管颜色。 */
   .bar.ok { background: #3fb950; }
   .bar.no { background: #8b949e; }
   .day-label { font-size: 10px; color: #6e7681; white-space: nowrap; }
 
-  .legend { display: flex; align-items: center; gap: 14px; margin-top: 8px;
+  .legend { display: flex; align-items: center; gap: 14px; margin-left: auto;
             font-size: 11px; color: #8b949e; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
               margin-right: 4px; }
@@ -125,7 +166,7 @@ export function renderDashboardHtml(options = {}) {
   .legend i.no { background: #8b949e; }
   .legend-note { margin-left: auto; color: #6e7681; }
 
-  /* ---- 下半(记录表) ---- */
+  /* ---- 记录表 ---- */
   .bottom { display: grid; grid-template-rows: auto auto minmax(0, 1fr);
             min-height: 0; overflow: hidden; }
   .bottom-bar { display: flex; align-items: center; justify-content: space-between;
@@ -168,10 +209,61 @@ export function renderDashboardHtml(options = {}) {
 
   /* 窄屏(手机)堆叠成单列 —— 三栏 squeezed 到手机上什么都看不清。 */
   @media (max-width: 900px) {
-    .screen { height: auto; }
-    .top { grid-template-columns: 1fr; height: auto; }
-    .bottom { height: 70vh; }
+    .screen { height: auto; min-height: 100%; }
+    /* 手机上把中间栏拆开:col 用 display:contents 后,它里面那两块直接参与
+       外层单列网格。不拆的话这一栏只分到一份行高,样式和知识库各挤成一条。 */
+    #viewSettings { grid-template-columns: 1fr; grid-template-rows: none;
+                    grid-auto-rows: minmax(220px, auto); }
+    .col { display: contents; }
+    #viewDelivery { grid-template-columns: 1fr; grid-template-rows: auto 70vh; }
+    .tab { padding: 6px 12px; }
+    .tabs .hint { display: none; }
+    /* 手机上统计数字和「本轮统计 / 导出 CSV」挤不进一行:横着排会把按钮压成
+       一条窄条、文字竖着折行。改成上下两段,按钮靠右,各自都完整。 */
+    .bottom-bar { flex-direction: column; align-items: stretch; gap: 10px; }
+    .stats { gap: 18px; flex-wrap: wrap; justify-content: space-between; }
+    .stat b { font-size: 18px; }
+    .actions { justify-content: flex-end; }
+    /* 7 组柱子挤不进 390px:收窄柱宽与间隙,目标是整周一眼看全,而不是左右拖。 */
+    .chart { gap: 2px; }
+    .day { min-width: 40px; }
+    .bars { gap: 3px; }
+    .bar { width: 11px; }
+    .ratio { font-size: 19px; }
   }
+  /* ---- 首次使用教学 ----
+     两层:一个问「要不要教」的对话框,和一层「走到哪一步」的引导。
+
+     引导层用 pointer-events:none,高亮块靠 box-shadow 拉出一大片暗色 —— 这样
+     被指到的控件仍然可以点、可以打字,用户边看边操作,而不是先看完再自己找。
+     整个教学只是 DOM 和 class,不引入任何外部资源。 */
+  .tour-ask { position: fixed; inset: 0; z-index: 60; display: flex;
+              align-items: center; justify-content: center; padding: 16px;
+              background: rgba(1, 4, 9, .72); }
+  .tour-ask[hidden] { display: none; }
+  .tour-ask-card { width: min(400px, calc(100vw - 32px)); background: #161b22;
+                   border: 1px solid #1f6feb; border-radius: 10px; padding: 18px 20px;
+                   box-shadow: 0 18px 48px rgba(0, 0, 0, .55); }
+  .tour-ask-card h3 { margin: 0 0 8px; font-size: 15px; }
+  .tour-ask-card p { margin: 0 0 16px; font-size: 12px; line-height: 1.7; color: #8b949e; }
+
+  .tour-layer { position: fixed; inset: 0; z-index: 55; pointer-events: none; }
+  .tour-layer[hidden] { display: none; }
+  .tour-layer.dim { background: rgba(1, 4, 9, .68); }
+  .tour-spot { position: absolute; border-radius: 8px;
+               box-shadow: 0 0 0 9999px rgba(1, 4, 9, .68);
+               border: 2px solid #1f6feb; pointer-events: none;
+               transition: left .18s ease, top .18s ease, width .18s ease, height .18s ease; }
+  .tour-spot[hidden] { display: none; }
+  .tour-card { position: fixed; z-index: 56; width: min(380px, calc(100vw - 24px));
+               background: #161b22; border: 1px solid #1f6feb; border-radius: 10px;
+               padding: 14px 16px; pointer-events: auto;
+               box-shadow: 0 18px 48px rgba(0, 0, 0, .55); }
+  .tour-step { font-size: 11px; color: #6e7681; margin-bottom: 4px; }
+  .tour-card h3 { margin: 0 0 6px; font-size: 14px; }
+  .tour-card p { margin: 0 0 14px; font-size: 12px; line-height: 1.7; color: #c9d1d9; }
+  .tour-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+
 </style>
 </head>
 <body>
@@ -181,23 +273,31 @@ export function renderDashboardHtml(options = {}) {
       <h1>HelloBoss</h1>
       <span class="hint">控制台跟着本页:最小化不影响;关掉这个标签页后控制台和正在运行的服务都会停止</span>
       <span class="status" id="ctrlStatus"></span>
-      <button id="lanBtn" type="button" title="让同一 WiFi 下的手机打开大屏">手机看大屏</button>
+      <button id="btnTour" type="button" title="重新看一遍使用教学">使用教学</button>
+      <a id="installScript" href="/install.user.js" title="把油猴脚本装进这个浏览器(需要先装篡改猴 / Tampermonkey)">安装油猴脚本</a>
       <button id="svcBtn" type="button" title="启动或停止后台判定服务">启动服务</button>
     </div>
-    <div id="lanInfo" class="lan-info"></div>
+
+    <nav class="tabs">
+      <button class="tab active" type="button" data-view="settings">① 设置</button>
+      <button class="tab" type="button" data-view="delivery">② 投递记录</button>
+      <span class="hint">先在「设置」里配好,再到「投递记录」看结果 —— 改完保存立即生效,不用重启服务</span>
+    </nav>
+
     <div id="ruleWarn">
       还没配置投递规则,当前<strong>不会投递任何岗位</strong>。
-      请在下方「打招呼判定」里写下你的规则并保存 —— 规则完全由你决定,服务端不内置任何默认规则。
+      请在「① 设置」页的「打招呼判定」里写下你的规则并保存 —— 规则完全由你决定,服务端不内置任何默认规则。
     </div>
-    <div id="profileWarn">
-      没加载到简历,当前<strong>不会投递任何岗位</strong>。
-      把简历放进服务目录的 resumes/ 里(复制 example.txt、改成别的文件名就行,也可以用 .typ),然后把右上角的判定服务停掉再启动一次 ——
-      判定要靠简历才能对岗位做取舍。
+    <div id="knowledgeWarn">
+      知识库还是空的,当前<strong>不会投递任何岗位</strong>。
+      请在「① 设置」页的「打招呼样式」下面,把你的简历内容直接粘进「知识库」里并保存 ——
+      判定和招呼语都只按这里的文字写,没有它就只能一个都不投。
     </div>
   </div>
 
-  <div class="top">
-    <section class="panel">
+  <!-- 第一页:设置。三块配置一屏放完,不用滚动去找。 -->
+  <section class="view active" id="viewSettings">
+    <section class="panel" id="panelRule">
       <h2>打招呼判定</h2>
       <p class="hint">留空时不会投递任何岗位。规则里写上城市、规模、薪资这些数字 —— 服务端不内置任何一份</p>
       <textarea id="decisionPrompt" placeholder="例如:月薪 20K 以上直接投;否则公司规模 1000 人以上才投,创业小公司不投"></textarea>
@@ -208,31 +308,31 @@ export function renderDashboardHtml(options = {}) {
       </div>
     </section>
 
-    <section class="panel">
-      <h2>打招呼样式</h2>
-      <p class="hint">这里写的是<strong>对 AI 的要求</strong>,不逐字发出 —— 所以可以随便写多写细,也不会出现「同一句话连发几百遍」。留空则只按简历和 JD 写</p>
-      <textarea id="greetingPrompt" placeholder="例如：&#10;对照 JD 提到的方向，说你确实做过的那部分。&#10;结尾落到「感觉非常适合这份工作」。&#10;不要点公司名，也不要说具体技术名词。"></textarea>
-      <div class="panel-foot">
-        <button id="btnGreetingSave" type="button">保存</button>
-        <button id="btnGreetingSample" type="button">填入示例</button>
-        <span class="status" id="greetingStatus"></span>
-      </div>
-    </section>
+    <!-- 中间栏:上面是「怎么写」,下面是「写什么」—— 两块挨着放,改完样式顺手就能改知识库。 -->
+    <div class="col">
+      <section class="panel" id="panelGreeting">
+        <h2>打招呼样式</h2>
+        <p class="hint">这里写的是<strong>对 AI 的要求</strong>,不逐字发出 —— 所以可以随便写多写细,也不会出现「同一句话连发几百遍」。留空则只按知识库和 JD 写</p>
+        <textarea id="greetingPrompt" placeholder="例如：&#10;对照 JD 提到的方向，说你确实做过的那部分。&#10;结尾落到「感觉非常适合这份工作」。&#10;不要点公司名，也不要说具体技术名词。"></textarea>
+        <div class="panel-foot">
+          <button id="btnGreetingSave" type="button">保存</button>
+          <button id="btnGreetingSample" type="button">填入示例</button>
+          <span class="status" id="greetingStatus"></span>
+        </div>
+      </section>
 
-    <section class="panel">
-      <h2>每日投递量</h2>
-      <p class="hint">已判定 = 当天拿到 AI 判定结论的岗位(含已投递);黑名单 / 已沟通等前置跳过未走到判定,不计入</p>
-      <span class="ratio" id="ratio"
-            title="最近 7 天:已判定 ÷ 已投递。倍数越高 = 每投出 1 份要判掉越多份,衡量的是筛选力度,不是投递效果。窗口内已投递不足 20 份时样本太小,不显示数字"></span>
-      <div class="chart" id="chart"></div>
-      <div class="legend">
-        <span><i class="ok"></i>已投递</span>
-        <span><i class="no"></i>已判定</span>
-        <span class="legend-note">最近 7 天</span>
-      </div>
-    </section>
+      <section class="panel" id="panelKnowledge">
+        <h2>知识库</h2>
+        <p class="hint">把你的简历内容<strong>直接粘进来</strong>,不用管格式 —— 判定与招呼语都只按这里的文字写。留空时不会投递任何岗位</p>
+        <textarea id="knowledge" placeholder="把简历全文粘在这里即可,例如:&#10;姓名、学校与专业&#10;实习 / 工作经历:公司、岗位、做了什么&#10;项目经历:项目名、你负责的部分&#10;技能与获奖(可选)"></textarea>
+        <div class="panel-foot">
+          <button id="btnKnowledgeSave" type="button">保存</button>
+          <span class="status" id="knowledgeStatus"></span>
+        </div>
+      </section>
+    </div>
 
-    <section class="panel">
+    <section class="panel" id="panelAi">
       <h2>AI 接入</h2>
       <p class="hint">判定与招呼语都用这里配的模型。密钥只留在本机 data/settings.json,不会随记录上报</p>
       <p class="hint">接口格式按端点地址自动识别:以 /chat/completions 结尾走 OpenAI 格式,否则走 Anthropic Messages 格式 —— 不用另配</p>
@@ -257,28 +357,74 @@ export function renderDashboardHtml(options = {}) {
         <span class="status" id="aiStatus"></span>
       </div>
     </section>
-  </div>
+  </section>
 
-  <div class="bottom panel">
-    <div class="bottom-bar">
-      <div class="stats" id="stats"></div>
-      <div class="actions">
-        <button id="btnScope" type="button">本轮统计</button>
-        <button id="btnExport" type="button">导出 CSV</button>
+  <!-- 第二页:投递记录。上面柱状图,下面流水。 -->
+  <section class="view" id="viewDelivery">
+    <section class="panel chart-panel">
+      <h2>每日投递量</h2>
+      <p class="hint">已判定 = 当天拿到 AI 判定结论的岗位(含已投递);黑名单 / 已沟通等前置跳过未走到判定,不计入</p>
+      <div class="chart-head">
+        <span class="ratio" id="ratio"
+              title="最近 7 天:已判定 ÷ 已投递。倍数越高 = 每投出 1 份要判掉越多份,衡量的是筛选力度,不是投递效果。窗口内已投递不足 20 份时样本太小,不显示数字"></span>
+        <div class="legend">
+          <span><i class="ok"></i>已投递</span>
+          <span><i class="no"></i>已判定</span>
+          <span class="legend-note">最近 7 天</span>
+        </div>
+      </div>
+      <div class="chart" id="chart"></div>
+    </section>
+
+    <div class="bottom panel">
+      <div class="bottom-bar">
+        <div class="stats" id="stats"></div>
+        <div class="actions">
+          <button id="btnScope" type="button">本轮统计</button>
+          <button id="btnExport" type="button">导出 CSV</button>
+        </div>
+      </div>
+      <div id="banner">连接中断，重试中…</div>
+      <div class="table-wrap" id="tableWrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th><th>公司</th><th>规模</th><th>岗位</th><th>地点</th>
+              <th>薪资</th><th>判定</th><th>实际</th><th>理由 / 话术</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty" id="empty">暂无记录。到「① 设置」页配好规则、再启动油猴脚本后,这里会实时出现岗位。</div>
       </div>
     </div>
-    <div id="banner">连接中断，重试中…</div>
-    <div class="table-wrap" id="tableWrap">
-      <table>
-        <thead>
-          <tr>
-            <th>时间</th><th>公司</th><th>规模</th><th>岗位</th><th>地点</th>
-            <th>薪资</th><th>判定</th><th>实际</th><th>理由 / 话术</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-      <div class="empty" id="empty">暂无记录。启动脚本后这里会实时出现岗位。</div>
+  </section>
+</div>
+
+<!-- 首次使用:先问一句要不要教。 -->
+<div class="tour-ask" id="tourAsk" hidden>
+  <div class="tour-ask-card">
+    <h3>要开启使用教学吗?</h3>
+    <p>大约一分钟,按顺序带你走一遍:装脚本、填三项配置、启动服务。每一步都会直接指到对应的位置。
+       选「不用」也能用,以后想再看可以从右上角「使用教学」重新打开。</p>
+    <div class="tour-actions">
+      <button id="tourDecline" type="button">不用,我自己看</button>
+      <button id="tourAccept" type="button">开启教学</button>
+    </div>
+  </div>
+</div>
+
+<!-- 引导层:一个跟着目标走的暗色遮罩 + 一张说明卡片。 -->
+<div class="tour-layer" id="tourLayer" hidden>
+  <div class="tour-spot" id="tourSpot"></div>
+  <div class="tour-card" id="tourCard">
+    <div class="tour-step" id="tourStep"></div>
+    <h3 id="tourTitle"></h3>
+    <p id="tourBody"></p>
+    <div class="tour-actions">
+      <button id="tourExit" type="button">退出教学</button>
+      <button id="tourPrev" type="button">上一步</button>
+      <button id="tourNext" type="button">下一步</button>
     </div>
   </div>
 </div>
@@ -342,14 +488,15 @@ export function renderDashboardHtml(options = {}) {
   var promptStatusEl = document.getElementById('promptStatus');
   var sampleBtn = document.getElementById('btnSample');
   var ruleWarnEl = document.getElementById('ruleWarn');
-  var profileWarnEl = document.getElementById('profileWarn');
+  var knowledgeWarnEl = document.getElementById('knowledgeWarn');
   var greetingPromptEl = document.getElementById('greetingPrompt');
   var greetingSaveBtn = document.getElementById('btnGreetingSave');
   var greetingSampleBtn = document.getElementById('btnGreetingSample');
   var greetingStatusEl = document.getElementById('greetingStatus');
+  var knowledgeEl = document.getElementById('knowledge');
+  var knowledgeSaveBtn = document.getElementById('btnKnowledgeSave');
+  var knowledgeStatusEl = document.getElementById('knowledgeStatus');
   var svcBtn = document.getElementById('svcBtn');
-  var lanBtn = document.getElementById('lanBtn');
-  var lanInfoEl = document.getElementById('lanInfo');
   var ctrlStatusEl = document.getElementById('ctrlStatus');
   var aiEndpointEl = document.getElementById('aiEndpoint');
   var aiKeyEl = document.getElementById('aiKey');
@@ -358,6 +505,54 @@ export function renderDashboardHtml(options = {}) {
   var aiTestBtn = document.getElementById('btnAiTest');
   var aiClearBtn = document.getElementById('btnAiClear');
   var aiStatusEl = document.getElementById('aiStatus');
+  var tabBtns = document.querySelectorAll('.tab');
+  var settingsViewEl = document.getElementById('viewSettings');
+  var deliveryViewEl = document.getElementById('viewDelivery');
+
+  // ---- 两个页面:设置 / 投递记录 ----
+  //
+  // 两页共用一份轮询、一条 watch 长连接和同一个本地游标 —— 拆成两条路由的话
+  // 这些状态都要各自维护,而且「关掉页面就停」那条连接还得两个页面都挂。
+  // 所以这里是同一份文档里的两个视图,只多一个「当前在看哪页」的状态。
+  //
+  // 默认回到设置页:一页只放按钮和提示的大屏没人用;两个页面各自的默认内容
+  // 都要靠设置页配出来,新用户从那里开始才对。上次停在投递页的人由 localStorage
+  // 记住 —— 大屏常常是开着看一眼记录的,每次都从设置页开始就多余了。
+  var VIEW_KEY = 'helloboss.view';
+
+  function initialView() {
+    try {
+      return localStorage.getItem(VIEW_KEY) === 'delivery' ? 'delivery' : 'settings';
+    } catch (e) {
+      // 某些浏览器策略下 localStorage 会直接抛,记住偏好不是必需功能,退回设置页即可。
+      return 'settings';
+    }
+  }
+
+  function switchView(name) {
+    var delivery = name === 'delivery';
+    settingsViewEl.classList.toggle('active', !delivery);
+    deliveryViewEl.classList.toggle('active', delivery);
+
+    for (var i = 0; i < tabBtns.length; i++) {
+      var btn = tabBtns[i];
+      btn.classList.toggle('active', btn.getAttribute('data-view') === (delivery ? 'delivery' : 'settings'));
+    }
+
+    try { localStorage.setItem(VIEW_KEY, delivery ? 'delivery' : 'settings'); } catch (e) {}
+
+    // 切回投递页时贴底:记录表是从早到晚、最新一条在表尾,而隐藏期间新记录
+    // 已经追加进来了(scrollHeight 在 display:none 时算不出来,只能等切回来再滚)。
+    if (delivery) tableWrapEl.scrollTop = tableWrapEl.scrollHeight;
+  }
+
+  for (var t = 0; t < tabBtns.length; t++) {
+    tabBtns[t].addEventListener('click', function () {
+      switchView(this.getAttribute('data-view'));
+    });
+  }
+
+  switchView(initialView());
 
   // 记录跨天是常态(脚本挂着跑),只有时分秒会让昨天的记录和今天的长得一样。
   // 用本地时间显示「月/日 时:分:秒」:at 存的是 UTC 串,直接切字符串会差 8 小时。
@@ -596,14 +791,13 @@ export function renderDashboardHtml(options = {}) {
     if (follow) tableWrapEl.scrollTop = tableWrapEl.scrollHeight;
   }
 
-  // ---- 服务状态与手机看大屏 ----
+  // ---- 服务状态 ----
 
   // 大屏由常驻的控制进程提供;右上角按钮启停的是后台判定服务。
   // 状态跟着 /api/records 的轮询一起回来,不再由 SSE 连接推断 —— 连接在只说明
   // 控制台还活着,并不说明判定服务开着。
   var watch = null;
   var service = { managed: false, running: true, state: 'running' };
-  var lan = { managed: false, enabled: false, urls: [] };
 
   function setCtrlStatus(message, tone) {
     ctrlStatusEl.textContent = message || '';
@@ -642,32 +836,6 @@ export function renderDashboardHtml(options = {}) {
     }
   }
 
-  function applyLan(data) {
-    if (!data) return;
-    lan = data;
-
-    var managed = data.managed !== false;
-    lanBtn.disabled = !managed;
-    lanBtn.textContent = managed && data.enabled ? '关闭手机访问' : '手机看大屏';
-    lanBtn.title = !managed
-      ? '当前是命令行启动,局域网开关不由大屏管理'
-      : (data.enabled ? '关闭局域网访问' : '让同一 WiFi 下的手机打开大屏');
-
-    var urls = data.urls || [];
-    if (managed && data.enabled) {
-      lanInfoEl.classList.add('show');
-      lanInfoEl.innerHTML = urls.length
-        ? '手机与电脑连同一个 WiFi,打开下面的地址(令牌已带在链接里,打开一次之后就会记住):<br>'
-          + urls.map(function (url) {
-            return '<a href="' + attr(url) + '">' + cell(url) + '</a>';
-          }).join('<br>')
-        : '已开启局域网访问,但没找到可用的局域网 IPv4 地址。';
-    } else {
-      lanInfoEl.classList.remove('show');
-      lanInfoEl.textContent = '';
-    }
-  }
-
   // 挂上这条连接。控制进程靠它判断「还有人在看大屏」——页面关掉这条连接就断了,
   // 控制进程会在宽限期后退出。重连(刷新、切回来、断线重试)由 EventSource 负责。
   function openWatch() {
@@ -675,23 +843,16 @@ export function renderDashboardHtml(options = {}) {
     watch = new EventSource('/api/watch');
   }
 
-  // 只为「没加载到简历」那条警告条去查 /health:一份简历都没有 = 一个岗位都投不出去,
+  // 只为「知识库是空的」那条警告条去查 /health:没有知识库 = 一个岗位都投不出去,
   // 这个原因必须写在页面上,不能让人去猜岗位为什么全被跳过。
-  function checkProfile() {
+  function checkKnowledge() {
     fetch('/health')
       .then(function (res) { return res.ok ? res.json() : null; })
       .then(function (health) {
         if (!health) return;
-        profileWarnEl.classList.toggle('show', health.profiles === 0);
+        knowledgeWarnEl.classList.toggle('show', health.hasKnowledge === false);
       })
       // 查不到就维持现状,别把警告条闪一下又收回去。
-      .catch(function () {});
-  }
-
-  function refreshLan() {
-    fetch('/api/lan')
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (data) { if (data) applyLan(data); })
       .catch(function () {});
   }
 
@@ -706,32 +867,12 @@ export function renderDashboardHtml(options = {}) {
     postJson('/api/service/' + action, {})
       .then(function (data) {
         applyService(data);
-        // 服务刚启动时简历才算真正加载,顺手刷新一下警告条。
-        if (action === 'start') checkProfile();
+        // 服务刚启动时配置才算真正生效,顺手刷新一下警告条。
+        if (action === 'start') checkKnowledge();
       })
       .catch(function (error) {
         setCtrlStatus(error.message || String(error), 'bad');
         applyService(service);
-      });
-  });
-
-  lanBtn.addEventListener('click', function () {
-    if (!lan || lan.managed === false) return;
-
-    var next = !lan.enabled;
-    lanBtn.disabled = true;
-    setCtrlStatus(next ? '正在开启手机访问…' : '正在关闭手机访问…', '');
-
-    postJson('/api/lan', { enabled: next })
-      .then(function (data) {
-        applyLan(data);
-        setCtrlStatus(next
-          ? '已开启:手机与电脑连同一个 WiFi 即可打开上面的地址'
-          : '已关闭手机访问', 'ok');
-      })
-      .catch(function (error) {
-        setCtrlStatus(error.message || String(error), 'bad');
-        applyLan(lan);
       });
   });
 
@@ -892,6 +1033,33 @@ export function renderDashboardHtml(options = {}) {
     setStatus(greetingStatusEl, '已填入示例，按你的情况改完再点保存', '');
   });
 
+  // ---- 知识库(简历全文,直接粘) ----
+
+  // 取代了原来的 resumes/ 目录:判定与招呼语都只按这里的文字写。
+  // 空着就是没简历 —— 服务端据此一个岗位都不投(见 evaluateJob 的 fail-closed 闸门),
+  // 所以保存后面要顺手刷新那条警告条。
+  function applyKnowledge(data) {
+    knowledgeEl.value = (data && data.knowledge) || '';
+  }
+
+  function saveKnowledge() {
+    knowledgeSaveBtn.disabled = true;
+    setStatus(knowledgeStatusEl, '保存中…', '');
+    postSettings({ knowledge: knowledgeEl.value })
+      .then(function (data) {
+        applyKnowledge(data.settings || {});
+        setStatus(knowledgeStatusEl, '已保存,下一个岗位立即生效', 'ok');
+        checkKnowledge();
+      })
+      .catch(function (error) {
+        // 服务端的报错很具体(超了多少字),原样显示才有用。
+        setStatus(knowledgeStatusEl, error.message || String(error), 'bad');
+      })
+      .finally(function () { knowledgeSaveBtn.disabled = false; });
+  }
+
+  knowledgeSaveBtn.addEventListener('click', saveKnowledge);
+
   // ---- AI 接入 ----
 
   // 服务端 detectApiFormat 的两个返回值 → 给人看的名字。
@@ -924,8 +1092,6 @@ export function renderDashboardHtml(options = {}) {
         var saved = (data && data.settings) || {};
         setKeyHint(saved.hasAiKey, saved.aiKeyHint);
         setStatus(aiStatusEl, '已保存,下一个岗位立即生效', 'ok');
-        // 重查一次简历那条警告:清了密钥之后后果会变(判定全跳过),得让人当场看见。
-        checkProfile();
       })
       .catch(function (error) {
         setStatus(aiStatusEl, error.message || String(error), 'bad');
@@ -982,7 +1148,6 @@ export function renderDashboardHtml(options = {}) {
       .then(function () {
         setKeyHint(false, '');
         setStatus(aiStatusEl, '已清除密钥,判定将全部跳过', 'ok');
-        checkProfile();
       })
       .catch(function (error) {
         setStatus(aiStatusEl, error.message || String(error), 'bad');
@@ -993,7 +1158,8 @@ export function renderDashboardHtml(options = {}) {
   // 只在页面加载时读一次,**不进轮询循环**:进了的话用户正在输入时会被服务端的
   // 旧值覆盖,打到一半的规则突然消失。
   function loadSettings() {
-    fetch('/api/settings')
+    // 返回这个 Promise:首屏教学要等它读完,才知道这次是不是一个还没配过的用户。
+    return fetch('/api/settings')
       .then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json();
@@ -1006,15 +1172,20 @@ export function renderDashboardHtml(options = {}) {
         // 一个空框还锁着,只会让第一次用的人以为这个功能坏了。
         setPromptMode(savedRule.trim() ? 'locked' : 'editing');
         applyGreetingPrompt(data);
+        applyKnowledge(data);
         aiEndpointEl.value = data.aiEndpoint || '';
         aiModelEl.value = data.aiModel || '';
         // 密钥不回填 —— 服务端不回传明文,这里只用末四位提示「已配置 / 未配置」。
         setKeyHint(data.hasAiKey, data.aiKeyHint);
+        return data;
       })
       .catch(function (error) {
         // 读不到就别锁 —— 锁住的话这个框彻底没法用,而用户可能正是来改它的。
         setPromptMode('editing');
         setStatus(promptStatusEl, '配置读取失败:' + (error.message || error), 'bad');
+        // 返回 null 而不是抛出去:教学那边据此判断「读不到就别弹」——
+        // 一个连配置都读不出来的大屏,弹教学只是噪声。
+        return null;
       });
   }
 
@@ -1038,13 +1209,196 @@ export function renderDashboardHtml(options = {}) {
     location.href = '/api/export.csv';
   });
 
-  loadSettings();
-  // 首屏就把「没加载到简历」这条说清楚。光看状态灯是绿的会让人以为一切正常,
-  // 而一份简历都没有时其实一个岗位都投不出去。
-  checkProfile();
-  refreshLan();
+  // ---- 首次使用教学 ----
+  //
+  // 为什么放在大屏而不是用户脚本面板里:新用户第一眼看到的是大屏,而「脚本要装进
+  // 浏览器」这件事大屏本身看不出来 —— 他不知道该去哪装、装完有没有生效。所以这里
+  // 按顺序把人带到每一块该填的地方,并顺带说清「判定服务还要单独点一下启动」。
+  //
+  // 记住「看过了」用 localStorage:大屏始终是同一个端口,同一台机器上够用;
+  // 浏览器禁用 localStorage 时退回内存标记,至少同一次会话里不再重复问。
+  var TOUR_KEY = 'helloboss.tour.seen';
+  var tourSeenInMemory = false;
+
+  function tourSeen() {
+    if (tourSeenInMemory) return true;
+    try { return localStorage.getItem(TOUR_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  function markTourSeen() {
+    tourSeenInMemory = true;
+    try { localStorage.setItem(TOUR_KEY, '1'); } catch (e) {}
+  }
+
+  // 每一步:指到哪个元素、说什么。target 为空表示「没有具体位置」,卡片居中。
+  // view 是这一步之前要先切到哪一页 —— 面板只在设置页存在。
+  //
+  // 文案只讲「现在该做什么」,不复述文档。教程的价值在于**定位**,不在信息量。
+  var TOUR_STEPS = [
+    {
+      target: 'installScript',
+      title: '第一步:把脚本装进浏览器',
+      body: '先在浏览器的扩展商店装「篡改猴 / Tampermonkey」。装好后回到这一页,点右上角这个「安装油猴脚本」,篡改猴会弹出安装框,点「安装」。装完刷新 BOSS 直聘页面,右侧就会多出一个脚本面板。',
+    },
+    {
+      target: 'panelAi',
+      view: 'settings',
+      title: '第二步:填 AI 接入',
+      body: '端点、密钥、模型名。填完先点「测试连通」—— 当场验证能不能通,比跑起来之后猜「为什么一个都不投」省事得多。密钥只留在本机。',
+    },
+    {
+      target: 'panelRule',
+      view: 'settings',
+      title: '第三步:写投递规则',
+      body: '用大白话写你想投什么样的岗位,比如薪资、城市、公司规模。不会写就点「填入示例」再改成自己的。这一项空着,一个岗位都不会投 —— 这是故意的。',
+    },
+    {
+      target: 'panelKnowledge',
+      view: 'settings',
+      title: '第四步:粘知识库',
+      body: '把简历内容整段粘进来,不用管格式。判定和招呼语都只按这段文字写;空着同样一个岗位都不投。',
+    },
+    {
+      target: 'svcBtn',
+      title: '第五步:启动判定服务',
+      body: '点右上角这个按钮。按钮变成「停止服务」、颜色变绿,就说明服务起来了。服务停着时大屏照样能看记录、改配置,但不会有任何岗位被判定。(如果你是用 npm start 起的,判定本来就在跑,按钮会显示「服务运行中」—— 这步跳过即可。)',
+    },
+    {
+      target: '',
+      title: '最后一步:回到 BOSS 直聘开始',
+      body: '切到 BOSS 直聘页面,在右侧脚本面板上把「问候语来源」保持为「AI 判定」(默认就是),然后点「开始」。之后这里会实时出现每个岗位的判定结果。做完了,点下面的「完成」。',
+    },
+  ];
+
+  var tourIndex = 0;
+  var tourAskEl = document.getElementById('tourAsk');
+  var tourLayerEl = document.getElementById('tourLayer');
+  var tourSpotEl = document.getElementById('tourSpot');
+  var tourCardEl = document.getElementById('tourCard');
+  var tourStepEl = document.getElementById('tourStep');
+  var tourTitleEl = document.getElementById('tourTitle');
+  var tourBodyEl = document.getElementById('tourBody');
+  var tourPrevBtn = document.getElementById('tourPrev');
+  var tourNextBtn = document.getElementById('tourNext');
+  var tourExitBtn = document.getElementById('tourExit');
+
+  // 把卡片放在目标下方;下方放不下就放上方;再放不下就贴着底边。
+  // 左右夹在视口内,免得宽屏上的 AI 面板把卡片推到屏幕外。
+  function placeTourCard(rect) {
+    var gap = 12;
+    var cardW = tourCardEl.offsetWidth;
+    var cardH = tourCardEl.offsetHeight;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+
+    if (!rect) {
+      tourCardEl.style.left = Math.max(gap, (vw - cardW) / 2) + 'px';
+      tourCardEl.style.top = Math.max(gap, (vh - cardH) / 2) + 'px';
+      return;
+    }
+
+    var left = Math.min(Math.max(gap, rect.left), vw - cardW - gap);
+    var top = rect.bottom + gap;
+    if (top + cardH > vh - gap) top = rect.top - cardH - gap;
+    if (top < gap) top = vh - cardH - gap;
+
+    tourCardEl.style.left = Math.max(gap, left) + 'px';
+    tourCardEl.style.top = Math.max(gap, top) + 'px';
+  }
+
+  function renderTourStep() {
+    var step = TOUR_STEPS[tourIndex];
+    var target = step.target ? document.getElementById(step.target) : null;
+
+    tourStepEl.textContent = '第 ' + (tourIndex + 1) + ' / ' + TOUR_STEPS.length + ' 步';
+    tourTitleEl.textContent = step.title;
+    tourBodyEl.textContent = step.body;
+    tourPrevBtn.disabled = tourIndex === 0;
+    tourNextBtn.textContent = tourIndex === TOUR_STEPS.length - 1 ? '完成' : '下一步';
+
+    if (step.view) switchView(step.view);
+
+    if (!target) {
+      // 没有具体目标:整层压暗、卡片居中,不画高亮框。
+      tourLayerEl.classList.add('dim');
+      tourSpotEl.hidden = true;
+      placeTourCard(null);
+      return;
+    }
+
+    tourLayerEl.classList.remove('dim');
+    tourSpotEl.hidden = false;
+
+    // 目标可能在可视区之外(窗口小的时候)。先滚过去,再量位置。
+    if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'nearest' });
+
+    var rect = target.getBoundingClientRect();
+    var pad = 6;
+    tourSpotEl.style.left = (rect.left - pad) + 'px';
+    tourSpotEl.style.top = (rect.top - pad) + 'px';
+    tourSpotEl.style.width = (rect.width + pad * 2) + 'px';
+    tourSpotEl.style.height = (rect.height + pad * 2) + 'px';
+    placeTourCard(rect);
+  }
+
+  function openTour() {
+    tourIndex = 0;
+    tourAskEl.hidden = true;
+    tourLayerEl.hidden = false;
+    renderTourStep();
+  }
+
+  function closeTour() {
+    tourLayerEl.hidden = true;
+    tourAskEl.hidden = true;
+    markTourSeen();
+  }
+
+  tourNextBtn.addEventListener('click', function () {
+    if (tourIndex >= TOUR_STEPS.length - 1) { closeTour(); return; }
+    tourIndex += 1;
+    renderTourStep();
+  });
+
+  tourPrevBtn.addEventListener('click', function () {
+    if (tourIndex === 0) return;
+    tourIndex -= 1;
+    renderTourStep();
+  });
+
+  tourExitBtn.addEventListener('click', closeTour);
+  document.getElementById('tourAccept').addEventListener('click', openTour);
+  document.getElementById('tourDecline').addEventListener('click', closeTour);
+  // 顶栏那个入口:用户主动点的,直接进教学,不再问一遍。
+  document.getElementById('btnTour').addEventListener('click', openTour);
+
+  // 窗口尺寸变化后高亮框和卡片都要重新量 —— 否则拖动窗口会把框留在原位。
+  window.addEventListener('resize', function () {
+    if (!tourLayerEl.hidden) renderTourStep();
+  });
+
+  // 只在「看起来还没配过」时主动问。
+  // 已经配好的人(升级上来的老用户)不该每次打开都被拦一下;
+  // 而三项里任何一项为空,都意味着一投不出去,正是最需要人带的时刻。
+  function maybeAskTour(settings) {
+    // 配置读不出来(settings 为 null)时不弹:那种情况下大屏自己都在报错,
+    // 再叠一层教学只会挡住用户看错误信息。
+    if (!settings) return;
+    if (tourSeen()) return;
+    var rule = String(settings.decisionPrompt || '').trim();
+    var knowledge = String(settings.knowledge || '').trim();
+    if (rule && knowledge && settings.hasAiKey) return;
+    tourAskEl.hidden = false;
+  }
+
+  loadSettings().then(maybeAskTour).catch(function () {});
+  // 首屏就把「知识库是空的」这条说清楚。光看状态灯是绿的会让人以为一切正常,
+  // 而知识库空着时其实一个岗位都投不出去。
+  checkKnowledge();
   // 这条连接也是「控制台跟随本页」的开关,见 openWatch()。
   openWatch();
+  // 轮询与当前在看哪一页无关:顶栏的服务灯、两页的红条都靠它,
+  // 而且切到投递页时记录和柱状图要已经是新的。
   poll();
   setInterval(poll, POLL_MS);
 </script>
