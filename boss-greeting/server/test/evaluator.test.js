@@ -1,8 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   extractJson,
   buildUserPrompt,
@@ -10,22 +7,22 @@ import {
   callChatApi,
   decideByPrompt,
   detectApiFormat,
-  buildResumeFacts,
+  buildKnowledgeFacts,
   buildGreetingPrompt,
   buildGreetingSystemPrompt,
   buildTemplateGreeting,
   buildProbePrompt,
 } from '../src/evaluator.js';
-import { parseResumeByExtension } from '../src/resumeParser.js';
 
-// 用仓库自带的示例简历(推荐格式是 .txt),而不是本机某份真实简历 ——
-// 这条测试要在任何人的 clone 上都跑得通。
-// 注意它是**在 import 阶段**读的:路径不对会让整个测试文件加载失败,而不是某一条用例失败。
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PROFILE = parseResumeByExtension(
-  'example.txt',
-  fs.readFileSync(path.resolve(HERE, '..', 'resumes', 'example.txt'), 'utf8'),
-);
+// 知识库是用户直接粘进来的简历全文。这里用一份脱敏的样例文本 ——
+// 这条测试要在任何人的 clone 上都跑得通,所以不能读本机某份真实简历。
+const KNOWLEDGE = [
+  '姓名:张三',
+  '教育:示例大学 计算机技术 硕士 2024.09 -- 2027.06',
+  '实习:某公司 测试开发实习生 2026.06 -- 2026.09,独立完成 Qt 上位机客户端开发。',
+  '项目:分布式卡牌对战系统,全栈独立开发。',
+  '技能:C/C++、JavaScript、Qt',
+].join('\n');
 
 test('extractJson 解析裸 JSON', () => {
   assert.deepEqual(extractJson('{"a":1}'), { a: 1 });
@@ -44,11 +41,11 @@ test('extractJson 对无法解析的内容抛错', () => {
   assert.throws(() => extractJson('完全没有 JSON'), /未找到 JSON/);
 });
 
-test('用户提示词包含岗位信息与简历要点', () => {
-  const user = buildUserPrompt({ jobName: 'Qt开发', postDescription: '上位机' }, PROFILE);
+test('用户提示词包含岗位信息与知识库', () => {
+  const user = buildUserPrompt({ jobName: 'Qt开发', postDescription: '上位机' }, KNOWLEDGE);
   assert.match(user, /Qt开发/);
   assert.match(user, /上位机/);
-  assert.match(user, /JavaScript/, '简历里的技能要点要带进去,否则模型无据可依');
+  assert.match(user, /JavaScript/, '知识库里的技能要点要带进去,否则模型无据可依');
 });
 
 // ---- 判定规则（prompt 就是唯一的事实来源） ----
@@ -74,7 +71,7 @@ test('AI 裁决返回布尔 apply 时正常通过', async () => {
     json: async () => ({ content: [{ type: 'text', text: '{"apply":true,"reason":"薪资达标"}' }] }),
   });
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: fakeFetch });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: fakeFetch });
   assert.equal(result.fallback, false);
   assert.equal(result.apply, true);
   assert.equal(result.reason, '薪资达标');
@@ -88,7 +85,7 @@ test('AI 裁决为「不投」是正常结论,不是 fallback', async () => {
     json: async () => ({ content: [{ type: 'text', text: '{"apply":false,"reason":"城市不符"}' }] }),
   });
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: fakeFetch });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: fakeFetch });
   assert.equal(result.fallback, false);
   assert.equal(result.apply, false);
   assert.equal(result.reason, '城市不符');
@@ -101,7 +98,7 @@ test('apply 不是布尔值时判为 fallback 而不是放行', async () => {
     return { ok: true, json: async () => ({ content: [{ type: 'text', text: '{"apply":"yes","reason":"x"}' }] }) };
   };
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: bogusFetch });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: bogusFetch });
   assert.equal(result.fallback, true);
   assert.equal(result.apply, false, '拿不到结论时必须是「不投」,不能默认放行成海投');
   assert.match(result.error, /布尔值/);
@@ -114,14 +111,14 @@ test('LLM 返回非法 JSON 时走兜底', async () => {
     json: async () => ({ content: [{ type: 'text', text: '我不知道' }] }),
   });
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: fakeFetch });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: fakeFetch });
   assert.equal(result.fallback, true);
   assert.match(result.error, /未找到 JSON/);
 });
 
 test('判定失败时带上错误原因', async () => {
   const fakeFetch = async () => ({ ok: false, status: 502, json: async () => ({}) });
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: fakeFetch });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: fakeFetch });
   assert.equal(result.fallback, true);
   assert.match(result.error, /502/);
 });
@@ -134,7 +131,7 @@ test('总预算封顶:两次尝试的合计耗时不得突破 budgetMs', async (
   });
 
   const startedAt = Date.now();
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', {
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', {
     fetchImpl: hangingFetch,
     budgetMs: 700,
   });
@@ -160,7 +157,7 @@ test('空响应触发重试,且重试放大 max_tokens', async () => {
     };
   };
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: emptyThenOk });
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: emptyThenOk });
 
   assert.equal(result.fallback, false);
   assert.equal(seenMaxTokens.length, 2, '空响应应当触发重试');
@@ -175,9 +172,9 @@ test('空响应触发重试,且重试放大 max_tokens', async () => {
 test('招呼语 system prompt 限定长度,并禁止编造经历', () => {
   const prompt = buildGreetingSystemPrompt();
   // 载重内容仍在:少了长度它会放飞成客套模板腔;少了「不许编造」那句,
-  // 它会拿简历里根本没有的经历凑句子。
+  // 它会拿知识库里根本没有的经历凑句子。
   assert.match(prompt, /60 字以内/);
-  assert.match(prompt, /编造简历里没有的经历/);
+  assert.match(prompt, /编造知识库里没有的经历/);
 });
 
 test('招呼语 system prompt:读者是 HR,不是工程师', () => {
@@ -191,12 +188,12 @@ test('招呼语 system prompt:读者是 HR,不是工程师', () => {
   assert.match(prompt, /方向/, '要给出该写到什么粒度');
 });
 
-test('招呼语 system prompt:简历是唯一事实来源,不许按 JD 认领经历', () => {
+test('招呼语 system prompt:知识库是唯一事实来源,不许按 JD 认领经历', () => {
   const prompt = buildGreetingSystemPrompt();
   // 这条是硬约束,松不得:JD 只用来挑重点,不是用来编造的依据。
-  // 松掉它,JD 里写「熟悉 Kubernetes」而简历里没有时,模型会替候选人认领。
-  assert.match(prompt, /简历是唯一的事实来源/);
-  assert.match(prompt, /宁可不提/, 'JD 要而简历没有的东西要略过,不许认领');
+  // 松掉它,JD 里写「熟悉 Kubernetes」而知识库里没有时,模型会替候选人认领。
+  assert.match(prompt, /知识库是唯一的事实来源/);
+  assert.match(prompt, /宁可不提/, 'JD 要而知识库里没有的东西要略过,不许认领');
   // 也不能走到另一个极端:写成「你好,我对贵司岗位很感兴趣」那种谁都能发的空话。
   assert.match(prompt, /确实做过/);
 });
@@ -209,7 +206,7 @@ test('招呼样式进 system,且被标成用户的额外要求', () => {
   assert.ok(prompt.includes(style), '用户写的要求要原样带上,不能被改写');
   // 硬性约束不能被样式要求顶掉 —— 用户就算写「写长一点」也不该真的写 500 字。
   assert.match(prompt, /60 字以内/);
-  assert.match(prompt, /编造简历里没有的经历/);
+  assert.match(prompt, /编造知识库里没有的经历/);
 });
 
 test('样式为空时不留下一个空的要求段落', () => {
@@ -219,123 +216,55 @@ test('样式为空时不留下一个空的要求段落', () => {
   }
 });
 
-test('样式只挂在 system 上,不混进岗位/简历那一段', () => {
+test('样式只挂在 system 上,不混进知识库/岗位那一段', () => {
   const style = '不要用感叹号。';
   const prompt = buildGreetingPrompt(
-    { name: '张三', sections: {} },
+    '知识库内容',
     { jobName: '后端', company: '某公司' },
     { stylePrompt: style },
   );
   assert.ok(prompt.system.includes(style));
-  assert.doesNotMatch(prompt.user, /感叹号/, '样式要求不该出现在简历/岗位那一段');
+  assert.doesNotMatch(prompt.user, /感叹号/, '样式要求不该出现在知识库/岗位那一段');
 });
 
-// ---- 简历事实清单 ----
+// ---- 知识库事实清单 ----
+//
+// 知识库取代了原来的 .txt / .typ 简历解析:用户直接把简历粘成一段文本,
+// 不存在「哪个字段是实习」这种结构,也就不再按槽位取。
 
-// 两种简历格式把「学历/角色/时间」放在不同字段里:
-//   .txt 的「单位 | 时间 | 备注」→ 角色在 position;
-//   .typ 宏格式 → 角色在 mid、时间在 rule。
-// 下面两份 fixture 只有字段摆放不同,内容一一对应。
-const TXT_STYLE_PROFILE = {
-  name: '钟骋',
-  sections: {
-    education: [{ title: '中国海洋大学（985）', time: '2024.09 -- 2027.06', position: '硕士 · 计算机技术', descs: [] }],
-    experience: [{
-      title: '海信（Hisense）',
-      time: '2026.06 -- 2026.09',
-      position: '测试开发实习生',
-      descs: [{ label: '上位机客户端开发', content: '独立完成 Qt 上位机客户端开发。' }],
-    }],
-    projects: [{ title: '分布式卡牌对战系统', time: '2025.06 -- 2026.03', position: '全栈独立开发', descs: [] }],
-    skills: [{ label: 'C/C++ 开发' }],
-  },
-};
-
-const TYP_STYLE_PROFILE = {
-  name: '钟骋',
-  sections: {
-    education: [{
-      title: '中国海洋大学（985）',
-      time: '硕士 | 计算机技术',
-      rule: '2024.09 -- 2027.06',
-      position: 'CCF-CCSP国铜、蓝桥杯国二',
-      descs: [],
-    }],
-    experience: [{
-      title: '海信（Hisense）',
-      time: '2026.06 -- 2026.09',
-      mid: '测试开发实习生',
-      position: '从0到1开发产品安全自动化测试软件',
-      descs: [],
-    }],
-    projects: [{ title: '分布式卡牌对战系统', time: '2025.06 -- 2026.03', mid: '全栈独立开发', descs: [] }],
-    skills: [{ label: 'C/C++ 开发' }],
-  },
-};
-
-test('简历事实清单带上实习与项目 —— 那才是能点名匹配的素材', () => {
-  // 这条守的是这次改动的根本:以前只传姓名+学校+技能标签,
-  // 「海信实习」「项目」全都没进提示词,模型无从知道,只能写「我很感兴趣」。
-  for (const profile of [TXT_STYLE_PROFILE, TYP_STYLE_PROFILE]) {
-    const facts = buildResumeFacts(profile);
-    assert.match(facts, /海信/, '实习公司必须进提示词');
-    assert.match(facts, /测试开发实习生/, '实习角色必须进提示词');
-    assert.match(facts, /分布式卡牌对战系统/, '项目必须进提示词');
-    assert.match(facts, /中国海洋大学/, '学校必须进提示词');
-    assert.match(facts, /C\/C\+\+ 开发/, '技能标签仍在');
-  }
+test('知识库原样进提示词 —— 那才是能点名匹配的素材', () => {
+  const facts = buildKnowledgeFacts(KNOWLEDGE);
+  assert.match(facts, /实习/, '实习段必须进提示词');
+  assert.match(facts, /测试开发实习生/, '实习角色必须进提示词');
+  assert.match(facts, /分布式卡牌对战系统/, '项目必须进提示词');
+  assert.match(facts, /示例大学/, '学校必须进提示词');
 });
 
-test('两种简历格式的字段摆放不同，事实清单都得取全', () => {
-  // .txt 把角色放在 position,.typ 把它放在 mid —— 按固定槽位取必然漏一种,
-  // 而漏掉的正好是「实习岗位是什么」这种最该让模型看见的信息。
-  assert.match(buildResumeFacts(TXT_STYLE_PROFILE), /测试开发实习生/);
-  assert.match(buildResumeFacts(TYP_STYLE_PROFILE), /测试开发实习生/);
-  // .typ 把获奖塞在 position、.txt 把学历塞在 position,两者都不能丢。
-  assert.match(buildResumeFacts(TYP_STYLE_PROFILE), /蓝桥杯国二/);
-  assert.match(buildResumeFacts(TXT_STYLE_PROFILE), /硕士/);
-});
-
-test('简历事实清单有长度上限,不会把整份简历塞进提示词', () => {
+test('知识库有长度上限,不会把整份简历塞进提示词', () => {
   // 提示词预算受 12 秒招呼语超时约束,塞爆它换来的只有「老是匹配不上」。
-  const huge = {
-    name: 'x'.repeat(500),
-    sections: {
-      experience: Array.from({ length: 10 }, (_, i) => ({
-        title: `公司${i}`,
-        position: 'y'.repeat(2000),
-        descs: [{ label: 'l', content: 'z'.repeat(2000) }],
-      })),
-      projects: Array.from({ length: 10 }, (_, i) => ({ title: `项目${i}`, position: 'p'.repeat(2000), descs: [] })),
-      skills: Array.from({ length: 50 }, (_, i) => ({ label: `技能${i}` })),
-      education: [],
-    },
-  };
-
-  const facts = buildResumeFacts(huge);
-  assert.ok(facts.length < 1200, `事实清单应被截断,实际 ${facts.length} 字`);
-  assert.doesNotMatch(facts, /公司2/, '实习只取前 2 条');
-  assert.doesNotMatch(facts, /项目2/, '项目只取前 2 条');
+  const huge = `开头${'x'.repeat(20000)}结尾`;
+  const facts = buildKnowledgeFacts(huge);
+  assert.ok(facts.length < 2100, `事实清单应被截断,实际 ${facts.length} 字`);
   // 截断处要有省略号,让人看得出是被砍过的。
   assert.match(facts, /…/);
 });
 
-test('简历事实清单对空/残缺输入不抛', () => {
-  assert.match(buildResumeFacts(undefined), /姓名:未知/);
-  assert.match(buildResumeFacts({}), /姓名:未知/);
-  assert.match(buildResumeFacts({ name: '张三' }), /姓名:张三/);
-  // descs 里混进非对象项不该炸。
-  assert.doesNotThrow(() => buildResumeFacts({ name: 'a', sections: { experience: [{ title: 't', descs: [null, 'x'] }] } }));
+test('知识库为空时如实写「空」,不抛错', () => {
+  for (const value of [undefined, null, '', '   ', 123]) {
+    const facts = buildKnowledgeFacts(value);
+    assert.match(facts, /知识库/);
+    assert.match(facts, /空/);
+  }
 });
 
-test('招呼语提示词同时带上简历事实、岗位名、公司与 JD', () => {
-  const prompt = buildGreetingPrompt(TXT_STYLE_PROFILE, {
+test('招呼语提示词同时带上知识库、岗位名、公司与 JD', () => {
+  const prompt = buildGreetingPrompt(KNOWLEDGE, {
     jobName: '上位机开发工程师',
     company: '某自动化公司',
     postDescription: '负责 Qt 上位机客户端与下位机串口通讯开发',
   });
 
-  assert.match(prompt.user, /海信/);
+  assert.match(prompt.user, /某公司/);
   assert.match(prompt.user, /上位机开发工程师/);
   assert.match(prompt.user, /某自动化公司/);
   assert.match(prompt.user, /串口通讯/);
@@ -343,16 +272,18 @@ test('招呼语提示词同时带上简历事实、岗位名、公司与 JD', ()
 });
 
 test('JD 缺失时提示词如实说明，而不是留个空标签让模型瞎猜', () => {
-  const prompt = buildGreetingPrompt(TXT_STYLE_PROFILE, { jobName: '某岗位', company: '某公司' });
+  const prompt = buildGreetingPrompt(KNOWLEDGE, { jobName: '某岗位', company: '某公司' });
   assert.doesNotMatch(prompt.user, /JD:\s*$/, '不该留一个空的 JD 标签');
   assert.match(prompt.user, /没返回岗位描述/);
 });
 
-test('模板兜底招呼语包含姓名、学校与岗位名', () => {
-  const text = buildTemplateGreeting(PROFILE, { jobName: 'Qt开发工程师' });
-  assert.match(text, /张三/);
-  assert.match(text, /示例大学/);
+test('模板兜底招呼语点名岗位，但不编造候选人背景', () => {
+  // 知识库是一段自由文本,取不到「学校」「技能」这类结构化字段 ——
+  // 兜底宁可少说,也不许替候选人编一段背景。
+  const text = buildTemplateGreeting(KNOWLEDGE, { jobName: 'Qt开发工程师' });
   assert.match(text, /Qt开发工程师/);
+  assert.doesNotMatch(text, /示例大学/);
+  assert.doesNotMatch(text, /张三/);
 });
 
 // ---- AI 接入配置（端点 / 密钥 / 模型由调用方注入） ----
@@ -533,7 +464,7 @@ test('OpenAI 端点下空响应同样触发重试并放大 max_tokens', async ()
     return okChatResponse('{"apply":true,"reason":"ok"}');
   };
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', {
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', {
     fetchImpl: fakeFetch,
     ai: { endpoint: 'https://x/v1/chat/completions', key: 'k', model: 'm' },
   });
@@ -571,7 +502,7 @@ test('decideByPrompt 不传 ai 时沿用旧默认端点（向后兼容）', asyn
     return okResponse('{"apply":true,"reason":"ok"}');
   };
 
-  await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', { fetchImpl: fakeFetch });
+  await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', { fetchImpl: fakeFetch });
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'http://127.0.0.1:15721/v1/messages');
@@ -585,7 +516,7 @@ test('decideByPrompt 显式传入 ai 时完全以传入为准', async () => {
     return okResponse('{"apply":false,"reason":"不投"}');
   };
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', {
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', {
     fetchImpl: fakeFetch,
     ai: { endpoint: 'https://api.anthropic.com/v1/messages', key: 'sk-ant-user', model: 'claude-sonnet-5' },
   });
@@ -604,7 +535,7 @@ test('decideByPrompt 显式传空密钥时直接 fallback，绝不回落到旧�
     return okResponse('{"apply":true,"reason":"不该放行"}');
   };
 
-  const result = await decideByPrompt({ jobName: 'x' }, PROFILE, '规则', {
+  const result = await decideByPrompt({ jobName: 'x' }, KNOWLEDGE, '规则', {
     fetchImpl: fakeFetch,
     ai: { endpoint: 'https://api.anthropic.com/v1/messages', key: '', model: 'claude-haiku-4-5' },
   });

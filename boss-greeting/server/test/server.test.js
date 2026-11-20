@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createServer, evaluateJob, buildGreetingViaLlm, isLoopbackAddress, isRequestAuthorized, loadServerConfig, isCrossOriginWrite } from '../src/server.js';
+import { createServer, evaluateJob, buildGreetingViaLlm, isLoopbackAddress, isCrossOriginWrite } from '../src/server.js';
 import { createIdleExit } from '../src/idleExit.js';
 import { createSettingsStore } from '../src/settings.js';
 
@@ -22,16 +22,15 @@ const JOB_OK = {
 //
 // 默认给一份**已配置**的规则。空规则是「一个岗位都不投」的安全默认(有专门的用例守着),
 // 而其余用例关心的是「有了规则之后」的编排,不该被它挡住。
+// 知识库现在是唯一的事实来源(取代了原来的 resumes/ 目录),桩里必须给一份 ——
+// 空知识库会让 evaluateJob 停在 fail-closed 闸门上(有专门的用例守着)。
+const KNOWLEDGE = '张三,示例大学计算机专业;在示例公司实习过,做过 Qt 上位机客户端。';
+
 function makeDeps(over = {}) {
   return {
-    // 健康检查读 deps.profiles.length,所以桩里必须是个真数组,不能省。
-    profiles: Array.from({ length: 5 }, (_, i) => ({ variant: `v${i}` })),
-    keywords: { priority: ['cpp', 'cpp_rag', 'iot', 'java', 'pdd'] },
-    profileOf: () => ({ variant: 'iot', name: '张三', sections: { education: [{ title: '示例大学' }], skills: [{ label: '嵌入式', content: 'x' }] } }),
-    selectVariant: () => ({ variant: 'iot', score: 9, evidence: ['MQTT(+5)'] }),
     settings: (() => {
       const store = makeStore();
-      store.save({ decisionPrompt: '测试规则:只投青岛的岗位' });
+      store.save({ decisionPrompt: '测试规则:只投青岛的岗位', knowledge: KNOWLEDGE });
       return store;
     })(),
     decideByPrompt: async () => ({ apply: true, reason: '规则命中', fallback: false }),
@@ -64,7 +63,7 @@ test('健康检查返回服务状态', async () => {
   const res = await fetch(`http://127.0.0.1:${port}/health`);
   const body = await res.json();
   assert.equal(body.ok, true);
-  assert.equal(body.profiles, 5);
+  assert.equal(body.hasKnowledge, true, '填了知识库就要报 true');
 
   server.close();
 });
@@ -73,7 +72,6 @@ test('/evaluate 通过时返回 apply 与招呼语', async () => {
   const result = await evaluateJob(JOB_OK, makeDeps());
   assert.equal(result.apply, true);
   assert.match(result.greeting, /张三/);
-  assert.equal(result.meta.variant, 'iot');
   assert.equal(result.meta.fallback, false);
   assert.equal(result.meta.cacheHit, false);
 });
@@ -131,7 +129,7 @@ test('生成招呼语抛异常时退回模板,判定通过仍投递', async () =
   assert.equal(result.apply, true);
   assert.equal(result.meta.greetingFallback, true);
   assert.equal(result.meta.fallback, false);
-  assert.match(result.greeting, /张三/);
+  assert.match(result.greeting, /嵌入式软件工程师/, '兜底要点名岗位');
 });
 
 test('生成返回空串时退回模板,判定通过仍投递', async () => {
@@ -140,7 +138,7 @@ test('生成返回空串时退回模板,判定通过仍投递', async () => {
   const result = await evaluateJob(JOB_OK, deps);
   assert.equal(result.apply, true);
   assert.equal(result.meta.greetingFallback, true);
-  assert.match(result.greeting, /张三/);
+  assert.match(result.greeting, /嵌入式软件工程师/, '兜底要点名岗位');
 });
 
 test('招呼语一律由模型写，不再回落到固定句子', async () => {
@@ -278,12 +276,6 @@ test('缺少 job 字段时返回 400', async () => {
   server.close();
 });
 
-test('版本选不出来时用 priority 首位兜底', async () => {
-  const deps = makeDeps({ selectVariant: () => ({ variant: null, score: 0, evidence: [] }) });
-  const result = await evaluateJob(JOB_OK, deps);
-  assert.ok(result.meta.variant, '不能因为选版失败就整体失败');
-});
-
 test('/report 写入后能被 /api/records 读到', async () => {
   const server = makeServer();
   await new Promise((r) => server.listen(0, r));
@@ -419,164 +411,6 @@ test('/report 收到非法 JSON 时返回 400', async () => {
   server.close();
 });
 
-// ---------- 局域网访问鉴权 ----------
-//
-// 规则:不配 token 就完全维持老行为;配了 token 则"本机回环免令牌、外来必须带令牌"。
-// 因此测试必须能把回环豁免关掉(allowLoopback: false),否则从 127.0.0.1 发起的
-// 请求永远走豁免分支,鉴权这段代码一行都测不到。
-
-test('loadServerConfig: 缺文件时不开放局域网、不鉴权', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
-  const config = loadServerConfig(path.join(dir, 'server.json'));
-  assert.deepEqual(config, { lan: false, token: '' });
-});
-
-test('loadServerConfig: 开了局域网却没令牌时拒绝启动', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
-  const file = path.join(dir, 'server.json');
-  fs.writeFileSync(file, JSON.stringify({ lan: true, token: '  ' }), 'utf8');
-  assert.throws(() => loadServerConfig(file), /没有 token/);
-});
-
-test('loadServerConfig: 读得到 lan 与 token', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-'));
-  const file = path.join(dir, 'server.json');
-  fs.writeFileSync(file, JSON.stringify({ lan: true, token: 'abc123' }), 'utf8');
-  assert.deepEqual(loadServerConfig(file), { lan: true, token: 'abc123' });
-});
-
-test('isLoopbackAddress 认回环的各种写法', () => {
-  for (const address of ['127.0.0.1', '127.5.5.5', '::1', '::ffff:127.0.0.1', 'LOCALHOST']) {
-    assert.equal(isLoopbackAddress(address), true, `${address} 应判为回环`);
-  }
-  for (const address of ['::ffff:192.168.1.7', '192.168.1.7', '8.8.8.8', '', undefined]) {
-    assert.equal(isLoopbackAddress(address), false, `${address} 不该判为回环`);
-  }
-});
-
-test('isRequestAuthorized: 没配令牌时全部放行', () => {
-  assert.equal(isRequestAuthorized({ remoteAddress: '8.8.8.8', headers: {}, token: '' }), true);
-});
-
-test('isRequestAuthorized: 回环免令牌,外来要令牌', () => {
-  const token = 'secret-token';
-  assert.equal(isRequestAuthorized({ remoteAddress: '127.0.0.1', headers: {}, token }), true);
-  assert.equal(isRequestAuthorized({ remoteAddress: '192.168.1.7', headers: {}, token }), false);
-  assert.equal(
-    isRequestAuthorized({ remoteAddress: '192.168.1.7', headers: { authorization: `Bearer ${token}` }, token }),
-    true,
-  );
-  assert.equal(
-    isRequestAuthorized({ remoteAddress: '192.168.1.7', headers: { authorization: 'Bearer 错的' }, token }),
-    false,
-  );
-  assert.equal(
-    isRequestAuthorized({ remoteAddress: '192.168.1.7', headers: { cookie: `big_screen_token=${token}` }, token }),
-    true,
-  );
-});
-
-test('isRequestAuthorized: 关掉回环豁免后本机也要令牌', () => {
-  const token = 'secret-token';
-  const base = { remoteAddress: '127.0.0.1', headers: {}, token, allowLoopback: false };
-  assert.equal(isRequestAuthorized(base), false);
-  assert.equal(isRequestAuthorized({ ...base, headers: { authorization: `Bearer ${token}` } }), true);
-});
-
-test('鉴权: 未带令牌的读接口与上报接口都返回 401', async () => {
-  const server = makeServer({ token: 'secret-token', allowLoopback: false });
-  await new Promise((r) => server.listen(0, r));
-  const port = server.address().port;
-
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/records`)).status, 401);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 401);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/dashboard`)).status, 401);
-  // 写配置的接口尤其要挡在鉴权之内 —— 它决定了「哪些岗位会被自动投」。
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/settings`)).status, 401);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/settings`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ decisionPrompt: '全部投' }),
-  })).status, 401);
-
-  const report = await fetch(`http://127.0.0.1:${port}/report`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ company: '甲' }),
-  });
-  assert.equal(report.status, 401);
-
-  const evaluate = await fetch(`http://127.0.0.1:${port}/evaluate`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ job: JOB_OK }),
-  });
-  assert.equal(evaluate.status, 401);
-
-  // 未授权的 /report 必须被闸在写库之前 —— 带上令牌再看,记录数应当仍是 0。
-  const records = await (await fetch(`http://127.0.0.1:${port}/api/records`, {
-    headers: { authorization: 'Bearer secret-token' },
-  })).json();
-  assert.equal(records.records.length, 0);
-
-  server.close();
-});
-
-test('鉴权: 带对令牌的请求照常工作', async () => {
-  const server = makeServer({ token: 'secret-token', allowLoopback: false });
-  await new Promise((r) => server.listen(0, r));
-  const port = server.address().port;
-
-  const res = await fetch(`http://127.0.0.1:${port}/api/records?since=0`, {
-    headers: { authorization: 'Bearer secret-token' },
-  });
-  assert.equal(res.status, 200);
-  assert.equal((await res.json()).seq, 0);
-
-  server.close();
-});
-
-test('鉴权: 本机回环不带令牌也能看(默认豁免)', async () => {
-  const server = makeServer({ token: 'secret-token' });
-  await new Promise((r) => server.listen(0, r));
-  const port = server.address().port;
-
-  assert.equal((await fetch(`http://127.0.0.1:${port}/api/records`)).status, 200);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/dashboard`)).status, 200);
-
-  server.close();
-});
-
-test('鉴权: 带令牌访问看板会换 cookie 并跳到干净地址', async () => {
-  const server = makeServer({ token: 'secret-token', allowLoopback: false });
-  await new Promise((r) => server.listen(0, r));
-  const port = server.address().port;
-
-  const entry = await fetch(`http://127.0.0.1:${port}/dashboard?token=secret-token`, { redirect: 'manual' });
-  assert.equal(entry.status, 302);
-  assert.equal(entry.headers.get('location'), '/dashboard');
-  const cookie = entry.headers.get('set-cookie');
-  assert.match(cookie, /big_screen_token=secret-token/);
-  assert.match(cookie, /HttpOnly/i);
-  // Max-Age 必须是秒数 —— 写成 "30d" 这类非法值浏览器会直接忽略,退化成会话 cookie。
-  assert.match(cookie, /Max-Age=2592000/);
-
-  const page = await fetch(`http://127.0.0.1:${port}/dashboard`, {
-    headers: { cookie: `big_screen_token=secret-token` },
-  });
-  assert.equal(page.status, 200);
-  assert.match(await page.text(), /<!DOCTYPE html>/i);
-
-  server.close();
-});
-
-test('鉴权: 令牌不对时看板返回 401 且不下发 cookie', async () => {
-  const server = makeServer({ token: 'secret-token', allowLoopback: false });
-  await new Promise((r) => server.listen(0, r));
-  const port = server.address().port;
-
-  const res = await fetch(`http://127.0.0.1:${port}/dashboard?token=错的`, { redirect: 'manual' });
-  assert.equal(res.status, 401);
-  assert.equal(res.headers.get('set-cookie'), null);
-
-  server.close();
-});
-
 // ---- 自定义判定规则(设置页) ----
 
 test('evaluateJob: 没配规则时一个岗位都不投', async () => {
@@ -585,7 +419,7 @@ test('evaluateJob: 没配规则时一个岗位都不投', async () => {
   // 一个"没配就开投"的版本会让他在不知情的情况下按别人的标准投递。
   let called = 0;
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '   ', greetingPrompt: '' }) },
+    settings: { get: () => ({ decisionPrompt: '   ', greetingPrompt: '', knowledge: KNOWLEDGE }) },
     decideByPrompt: async () => { called += 1; return { apply: true, reason: 'x', fallback: false }; },
   });
 
@@ -598,17 +432,11 @@ test('evaluateJob: 没配规则时一个岗位都不投', async () => {
   assert.match(result.reason, /尚未配置投递规则/);
 });
 
-test('evaluateJob: 没有简历时一个岗位都不投,且不调 LLM、不抛错', async () => {
-  // 这条挡的是一个真实的 500:profile 为 undefined 时 buildUserPrompt 会去读
-  // profile.sections.skills 而抛错,且那段在 decideByPrompt 的重试 try/catch **之外**,
-  // 会一路冒到路由 —— 用户看到的是「服务坏了」,而不是「我还没放简历」。
+test('evaluateJob: 知识库为空时一个岗位都不投,且不调 LLM、不抛错', async () => {
   let called = 0;
   const deps = makeDeps({
-    profiles: [],
-    profileOf: () => undefined,
-    selectVariant: () => ({ variant: null, score: 0, evidence: [] }),
-    // 刻意给一条**非空**规则:证明「有规则但没简历」也照样不放行。
-    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '' }) },
+    // 刻意给一条**非空**规则:证明「有规则但没知识库」也照样不放行。
+    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '', knowledge: '   ' }) },
     decideByPrompt: async () => { called += 1; return { apply: true, reason: 'x', fallback: false }; },
   });
 
@@ -616,17 +444,17 @@ test('evaluateJob: 没有简历时一个岗位都不投,且不调 LLM、不抛�
 
   assert.equal(result.apply, false);
   assert.equal(result.greeting, '');
-  assert.equal(result.meta.noResume, true, '要和「没配规则」「AI 挂了」都区分开');
-  assert.equal(result.meta.fallback, true, '没结论就不进缓存 —— 补上简历后同一岗位要能重判');
-  assert.equal(called, 0, '没有简历就不该去调 LLM');
-  assert.match(result.reason, /尚未加载简历/);
+  assert.equal(result.meta.noKnowledge, true, '要和「没配规则」「AI 挂了」都区分开');
+  assert.equal(result.meta.fallback, true, '没结论就不进缓存 —— 补上知识库后同一岗位要能重判');
+  assert.equal(called, 0, '没有知识库就不该去调 LLM');
+  assert.match(result.reason, /尚未填写知识库/);
 });
 
 test('evaluateJob: 配了规则时把规则原文交给裁决函数', async () => {
   let calledWith = '';
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '' }) },
-    decideByPrompt: async (job, profile, ruleText) => {
+    settings: { get: () => ({ decisionPrompt: '只要青岛就投', greetingPrompt: '', knowledge: KNOWLEDGE }) },
+    decideByPrompt: async (job, knowledge, ruleText) => {
       calledWith = ruleText;
       return { apply: true, reason: '城市命中', fallback: false };
     },
@@ -640,7 +468,7 @@ test('evaluateJob: 配了规则时把规则原文交给裁决函数', async () =
 
 test('evaluateJob: 规则裁决失败时按「判不了」处理,不是「判定不投」', async () => {
   const deps = makeDeps({
-    settings: { get: () => ({ decisionPrompt: '规则', greetingPrompt: '' }) },
+    settings: { get: () => ({ decisionPrompt: '规则', greetingPrompt: '', knowledge: KNOWLEDGE }) },
     decideByPrompt: async () => ({ apply: false, reason: '', fallback: true, error: '端点超时' }),
   });
 
@@ -870,16 +698,18 @@ test('健康检查报告 AI 是否已配置（但不回传密钥）', async () =
   configured.close();
 });
 
-test('一份简历都没有时服务照常启动，/health 报告 profiles: 0', async () => {
-  // 开源后的默认状态可能正是「还没放简历」。这时服务必须能起来 —— 否则用户
-  // 连大屏都打不开,也就永远看不到那句「把简历放进 resumes/」的提示。
-  const server = makeServer({ deps: makeDeps({ profiles: [], profileOf: () => undefined }) });
+test('知识库为空时服务照常启动，/health 报告 hasKnowledge: false', async () => {
+  // 开源后的默认状态可能正是「还没填知识库」。这时服务必须能起来 —— 否则用户
+  // 连大屏都打不开,也就永远看不到那句「把简历粘进知识库」的提示。
+  const server = makeServer({
+    deps: makeDeps({ settings: { get: () => ({ decisionPrompt: '规则', greetingPrompt: '', knowledge: '' }) } }),
+  });
   await new Promise((r) => server.listen(0, r));
   const port = server.address().port;
 
   const body = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
-  assert.equal(body.ok, true, '没有简历也要报 ok —— 服务本身是好的,缺的是配置');
-  assert.equal(body.profiles, 0, '大屏靠这个数字决定要不要显示「没加载到简历」的警告条');
+  assert.equal(body.ok, true, '没有知识库也要报 ok —— 服务本身是好的,缺的是配置');
+  assert.equal(body.hasKnowledge, false, '大屏靠这个布尔决定要不要显示「知识库是空的」的警告条');
 
   const dash = await fetch(`http://127.0.0.1:${port}/dashboard`);
   assert.equal(dash.status, 200, '大屏要能打开,用户才有地方看到提示');
@@ -891,11 +721,13 @@ test('改配置后判定缓存被清空,新规则立即生效', async () => {
   // 缓存的 bug 形态很隐蔽:缓存命中时连 meta 都照抄旧结果,用户改完规则重跑,
   // 看到的是旧结论,只会以为「改了没用」—— 而不是怀疑缓存。
   const store = makeStore();
+  // 知识库也要有 —— 否则每个岗位都会先撞上 noKnowledge 闸门,缓存根本不会建。
+  store.save({ knowledge: KNOWLEDGE });
   const deps = makeDeps({
     settings: store,
     // 桩:规则里出现「放行」就投,否则不投。规则变了结论必须跟着变。
     // 两个词必须无包含关系 —— 用「投/不投」的话 includes('投') 恒为真,测不出缓存。
-    decideByPrompt: async (job, profile, ruleText) => ({
+    decideByPrompt: async (job, knowledge, ruleText) => ({
       apply: ruleText.includes('放行'), reason: ruleText, fallback: false,
     }),
   });
@@ -1186,31 +1018,24 @@ test('POST /api/ai/test 在服务没接探测能力时回 503', async () => {
 // 用真实的 buildGreetingViaLlm 串起来，只把最外面的 callLlm 换成桩 ——
 // 这条链断了不会报错，只会静默退化成「每次都发模板句」，所以要端到端守。
 //
-// 简历必须有实习和项目:makeDeps 的默认桩只有教育 + 技能，而「点名实习/项目」
-// 正是这个功能要守的东西 —— 用默认桩等于把要验的素材抽掉了。
-const GREETING_PROFILE = {
-  variant: 'iot',
-  name: '张三',
-  sections: {
-    education: [{ title: '中国海洋大学（985）', time: '2024.09 -- 2027.06', position: '硕士 · 计算机技术', descs: [] }],
-    experience: [{
-      title: '海信（Hisense）',
-      time: '2026.06 -- 2026.09',
-      position: '测试开发实习生',
-      descs: [{ label: '上位机客户端开发', content: '独立完成 Qt 上位机客户端开发。' }],
-    }],
-    projects: [{ title: '分布式卡牌对战系统', time: '2025.06 -- 2026.03', position: '全栈独立开发', descs: [] }],
-    skills: [{ label: 'C/C++ 与上位机开发', content: '熟悉 Qt' }],
-  },
-};
+// 知识库里必须有实习和项目:默认桩只有一句话,而「点名实习/项目」正是这个功能
+// 要守的东西 —— 用一句话的桩等于把要验的素材抽掉了。
+const GREETING_KNOWLEDGE = [
+  '张三,中国海洋大学计算机技术硕士(2024.09 -- 2027.06)。',
+  '实习:海信(Hisense) 测试开发实习生(2026.06 -- 2026.09),独立完成 Qt 上位机客户端开发。',
+  '项目:分布式卡牌对战系统(2025.06 -- 2026.03),全栈独立开发。',
+  '技能:C/C++ 与上位机开发,熟悉 Qt。',
+].join('\n');
 
 function greetingDeps(replyText, options = {}) {
   const calls = [];
   return {
     calls,
     deps: makeDeps({
-      profileOf: () => GREETING_PROFILE,
-      buildGreeting: (job, profile) => buildGreetingViaLlm(job, profile, {
+      settings: {
+        get: () => ({ decisionPrompt: '测试规则', greetingPrompt: options.stylePrompt || '', knowledge: GREETING_KNOWLEDGE }),
+      },
+      buildGreeting: (job, knowledge) => buildGreetingViaLlm(job, knowledge, {
         stylePrompt: options.stylePrompt || '',
         callLlm: async (system, user) => {
           calls.push({ system, user });
@@ -1230,8 +1055,9 @@ test('提示词里带上实习与项目，模型输出被原样采用', async ()
   const result = await evaluateJob(JOB_OK, deps);
 
   assert.equal(calls.length, 1);
-  assert.match(calls[0].user, /实习:/, '提示词必须带上实习段');
-  assert.match(calls[0].user, /项目:/, '提示词必须带上项目段');
+  assert.match(calls[0].user, /知识库/, '提示词必须带上知识库');
+  assert.match(calls[0].user, /实习/, '知识库里的实习段要原样带进去');
+  assert.match(calls[0].user, /项目/, '知识库里的项目段要原样带进去');
   assert.match(calls[0].user, /海信/);
   assert.equal(result.greeting, matched);
 });
@@ -1475,55 +1301,57 @@ test('保存配置会通知后台服务清掉判定缓存', async () => {
   server.close();
 });
 
-test('/api/lan: 读取状态与开关局域网', async () => {
-  const lan = {
-    enabled: false,
-    calls: [],
-    status() {
-      return {
-        managed: true,
-        enabled: this.enabled,
-        token: 'test-token',
-        urls: this.enabled ? ['http://192.168.1.2:8787/dashboard?token=test-token'] : [],
-      };
-    },
-    async setEnabled(enabled) {
-      this.calls.push(enabled);
-      this.enabled = enabled;
-      return this.status();
-    },
-  };
-  const server = makeServer({ lanControl: lan });
+
+// ---- 「安装油猴脚本」这个 HTTP 入口 ----
+//
+// 单文件 exe 之后,脚本不再躺在 exe 旁边的文件夹里让用户自己去找,而是由服务发出来。
+// 篡改猴只对「以 .user.js 结尾的导航」弹安装框,所以路径与内容类型都必须钉住。
+
+test('/install.user.js 把油猴脚本原文发出来,内容类型让篡改猴能接管', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'srv-userscript-'));
+  const file = path.join(dir, 'zhipin-auto-greeting.user.js');
+  const source = '// ==UserScript==\n// @name 测试脚本\n// ==/UserScript==\n';
+  fs.writeFileSync(file, source);
+
+  const server = makeServer({ userscriptFile: file });
   const base = await listenOn(server);
 
-  const before = await (await fetch(`${base}/api/lan`)).json();
-  assert.equal(before.enabled, false);
-
-  const on = await (await fetch(`${base}/api/lan`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: true }),
-  })).json();
-  assert.equal(on.enabled, true);
-  assert.equal(on.urls.length, 1);
-  assert.deepEqual(lan.calls, [true]);
+  const res = await fetch(`${base}/install.user.js`);
+  assert.equal(res.status, 200);
+  // text/javascript 是篡改猴认安装请求的依据之一;给 text/plain 它会把源码当文本显示出来,
+  // 用户看到一屏幕代码而没有任何安装提示。
+  assert.match(res.headers.get('content-type'), /text\/javascript/);
+  assert.equal(await res.text(), source);
 
   server.close();
 });
 
-test('/api/lan: 命令行启动时不让页面改局域网', async () => {
-  const server = makeServer();
+test('脚本路径的两种写法都能装 —— 老书签里那个原文件名不能断', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'srv-userscript-alias-'));
+  const file = path.join(dir, 'zhipin-auto-greeting.user.js');
+  fs.writeFileSync(file, '// ==UserScript==\n// ==/UserScript==\n');
+
+  const server = makeServer({ userscriptFile: file });
   const base = await listenOn(server);
 
-  const body = await (await fetch(`${base}/api/lan`)).json();
-  assert.equal(body.managed, false);
+  const res = await fetch(`${base}/zhipin-auto-greeting.user.js`);
+  assert.equal(res.status, 200);
 
-  const res = await fetch(`${base}/api/lan`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: true }),
-  });
-  assert.equal(res.status, 503);
+  server.close();
+});
+
+test('脚本文件找不到时回 404 并说明找过哪里,而不是空响应', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'srv-userscript-missing-'));
+  const missing = path.join(dir, 'nope.user.js');
+
+  const server = makeServer({ userscriptFile: missing });
+  const base = await listenOn(server);
+
+  const res = await fetch(`${base}/install.user.js`);
+  assert.equal(res.status, 404);
+  const body = await res.json();
+  assert.match(body.error, /找不到油猴脚本/);
+  assert.ok(body.error.includes(missing), '错误里要带上找过的路径,否则用户无从下手');
 
   server.close();
 });

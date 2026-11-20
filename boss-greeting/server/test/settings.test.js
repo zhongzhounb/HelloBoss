@@ -40,6 +40,13 @@ test('读取时超长内容被截断而不是丢弃', () => {
   // 读取路径宽松:手改坏的文件不该让服务起不来。
   assert.equal(normalizeSettings({ decisionPrompt: 'a'.repeat(5000) }).decisionPrompt.length, 4000);
   assert.equal(normalizeSettings({ greetingPrompt: 'a'.repeat(5000) }).greetingPrompt.length, 1000);
+  assert.equal(normalizeSettings({ knowledge: 'a'.repeat(20000) }).knowledge.length, 12000);
+});
+
+test('读取时知识库不是字符串就退回空串', () => {
+  // 知识库为空 = 没简历 = 一个岗位都不投。坏值不能变成 "123" 这种假知识库。
+  assert.equal(normalizeSettings({ knowledge: 42 }).knowledge, '');
+  assert.equal(normalizeSettings({ knowledge: null }).knowledge, '');
 });
 
 // ---- validatePatch（保存路径：严格，要报错给人看） ----
@@ -63,6 +70,15 @@ test('保存时超长样式被拒而不是静默截断', () => {
 
 test('保存时空样式合法 —— 表示「不加额外要求」', () => {
   assert.equal(validatePatch({ greetingPrompt: '' }).greetingPrompt, '');
+});
+
+test('保存时非字符串知识库被拒,超长知识库被拒', () => {
+  assert.throws(() => validatePatch({ knowledge: 42 }), /必须是字符串/);
+  assert.throws(() => validatePatch({ knowledge: 'k'.repeat(12001) }), /知识库太长/);
+});
+
+test('保存时知识库可以为空 —— 表示没填,闸门据此一个都不投', () => {
+  assert.equal(validatePatch({ knowledge: '' }).knowledge, '');
 });
 
 test('只接受已知字段，多余的键被忽略', () => {

@@ -1,15 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-// 大屏上可以直接改的配置(判定规则、招呼样式、AI 接入)。
+// 大屏上可以直接改的配置(判定规则、招呼样式与知识库、AI 接入)。
 //
 // 为什么不放进 config/preferences.json:那些文件是**启动时**读一次、且是用户手改的静态配置,
 // 而这几项要在大屏上随时改、即时生效,并且是运行时数据。放 data/ 下还有个好处 ——
-// 它已经在 .gitignore 里,个人招呼样式与 API 密钥不会被提交进仓库。
+// 它已经在 .gitignore 里,个人知识库与 API 密钥不会被提交进仓库。
 //
-// 与 loadServerConfig 的错误处理**刻意相反**:服务配置(lan/token)坏掉必须拒绝启动(fail-closed),
-// 因为那关系到把记录暴露给整个局域网;而这里只是个可空开关,坏掉时退回「没有规则、没有样式要求」
-// —— 那恰好等于改造前的行为,服务照常跑,不该因为一个可选功能起不来。
+// 与「服务配置」的错误处理**刻意相反**:服务配置坏掉必须拒绝启动(fail-closed);
+// 而这里只是个可空开关,坏掉时退回「没有规则、没有样式要求」—— 那恰好等于改造前的行为,
+// 服务照常跑,不该因为一个可选功能起不来。
 
 // AI 接入的默认值。默认指向 Anthropic 官方端点、且**密钥留空**。
 // 空密钥 = 尚未接入,判定一律走 fallback(见 evaluator.callChatApi 的守卫),
@@ -21,6 +21,7 @@ export const DEFAULT_MODEL = 'claude-haiku-4-5';
 export const DEFAULTS = {
   decisionPrompt: '',
   greetingPrompt: '',
+  knowledge: '',
   aiEndpoint: DEFAULT_ENDPOINT,
   aiKey: '',
   aiModel: DEFAULT_MODEL,
@@ -29,6 +30,9 @@ export const MAX_PROMPT_CHARS = 4000;
 // 招呼样式是给模型看的要求,不是逐字发出去的文本,所以可以比原来的固定句子长得多。
 // 1000 字足够写清「优先点什么、没有对得上的怎么办、什么语气、哪些别说」。
 export const MAX_GREETING_PROMPT_CHARS = 1000;
+// 知识库就是用户直接粘进来的简历 / 个人背景文本,不再解析成结构化字段。
+// 上限给得比提示词宽:简历本身可以很长,真正进提示词时由 evaluator 再按预算截断。
+export const MAX_KNOWLEDGE_CHARS = 12000;
 export const MAX_ENDPOINT_CHARS = 300;
 export const MAX_KEY_CHARS = 300;
 export const MAX_MODEL_CHARS = 100;
@@ -70,6 +74,12 @@ export function normalizeSettings(raw) {
       typeof source.greetingPrompt === 'string'
         ? source.greetingPrompt.slice(0, MAX_GREETING_PROMPT_CHARS)
         : '',
+    // 知识库:用户直接粘进来的简历 / 个人背景全文。它替代了原来的 resumes/ 目录扫描,
+    // 是判定与招呼语唯一的事实来源 —— 空着就等于没简历,fail-closed 照旧。
+    knowledge:
+      typeof source.knowledge === 'string'
+        ? source.knowledge.slice(0, MAX_KNOWLEDGE_CHARS)
+        : '',
     // 读取路径**不校验 URL 形态**:文件被手改坏时宁可让它跑到 fetch 那一步失败
     // (结果是 fallback),也不要因为一个可选配置读不出来就让服务起不来。
     aiEndpoint: textOr(source.aiEndpoint, DEFAULT_ENDPOINT, MAX_ENDPOINT_CHARS),
@@ -78,8 +88,8 @@ export function normalizeSettings(raw) {
   };
 }
 
-// 给 HTTP 边界用的脱敏。**明文密钥绝不进 HTTP 响应体** —— 大屏是可以用令牌
-// 对局域网开放的,把密钥塞进响应等于把它交给同网段的每一台设备。
+// 给 HTTP 边界用的脱敏。**明文密钥绝不进 HTTP 响应体** ——
+// 响应体可能被页面或个人抓包留存,密钥没有任何理由出现在里面。
 //
 // aiKey 恒为空串,末四位单独放在 aiKeyHint 里只作显示。刻意不把末四位放进 aiKey:
 // 那样用户只改判定规则、连 key 一起提交时,存储里的真密钥会被这个截断串覆盖掉。
@@ -124,6 +134,16 @@ export function validatePatch(patch) {
       throw new Error(`招呼样式太长:${patch.greetingPrompt.length} 字,上限 ${MAX_GREETING_PROMPT_CHARS} 字`);
     }
     result.greetingPrompt = patch.greetingPrompt;
+  }
+
+  if ('knowledge' in patch) {
+    if (typeof patch.knowledge !== 'string') {
+      throw new Error('knowledge 必须是字符串');
+    }
+    if (patch.knowledge.length > MAX_KNOWLEDGE_CHARS) {
+      throw new Error(`知识库太长:${patch.knowledge.length} 字,上限 ${MAX_KNOWLEDGE_CHARS} 字`);
+    }
+    result.knowledge = patch.knowledge;
   }
 
   if ('aiEndpoint' in patch) {
@@ -181,7 +201,7 @@ export function createSettingsStore(file) {
 
   function get() {
     // 返回副本:调用方会随手改里面取出来的对象,复制一份免得把内部状态改掉。
-    // 配置项现在全是字符串与数字,展开一层就够(以前有 greetingSamples 数组时
+    // 配置项现在全是字符串,展开一层就够(以前有 greetingSamples 数组时
     // 还要额外 slice 一次,那个字段已经并进 greetingPrompt 了)。
     //
     // 用展开而不是逐字段列举 —— 否则以后再加配置项,漏补这里就会变成

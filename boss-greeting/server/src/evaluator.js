@@ -1,7 +1,7 @@
 // 判定与招呼语的 LLM 调用。
 //
 // **这里没有任何硬编码的筛选规则。** 投/不投完全由用户在设置页写的自然语言 prompt 决定
-// (`decideByPrompt`),服务端只负责把简历、岗位和那段规则拼成请求,并把模型的回答解析成
+// (`decideByPrompt`),服务端只负责把知识库、岗位和那段规则拼成请求,并把模型的回答解析成
 // 一个布尔结论。想适配另一个人,只需要换掉那段规则,不用改这个文件。
 //
 // 所以「读不出数字就误投」这类风险不再由代码兜底,而是靠 prompt 里写明 —— 这也是为什么
@@ -25,105 +25,37 @@ const MAX_TOKENS_RETRY = 8000;
 // 招呼语 prompt 里 JD 的截断长度。沿用改造前那份提示词里的 800。
 const GREETING_JD_CHARS = 800;
 
-// 简历各部分进提示词的条数与每条字数上限。
+// 知识库进提示词的字数上限。
 //
-// 为什么必须卡死:项目 descs 可以很长,全塞进去输入词元暴涨,而招呼语的预算只有
+// 知识库是用户直接粘进来的简历全文,不再经过结构化解剖 —— 所以这里要自己卡一个上限。
+// 为什么必须卡死:知识库可以很长,全塞进去输入词元暴涨,而招呼语的预算只有
 // GREETING_BUDGET_MS(12 秒)—— 超时就退回模板兜底,用户看到的是「招呼语怎么老匹配不上」。
-// 截断换来的稳定,比多塞两百字值。
 //
-// 注意这几项**不能靠调大来提升质量**:12 秒的上限受脚本侧 45 秒超时链约束
+// 注意这个值**不能靠调大来提升质量**:12 秒的上限受脚本侧 45 秒超时链约束
 // (见 server.js 顶部的超时预算注释),调大预算会先撞上脚本先断开的问题。
-const RESUME_PROMPT_LIMITS = {
-  education: 2,
-  educationChars: 90,
-  experience: 2,
-  experienceChars: 170,
-  projects: 2,
-  projectChars: 170,
-  skills: 10,
-};
+const KNOWLEDGE_PROMPT_CHARS = 2000;
 
 function truncateText(text, limit) {
   const value = String(text == null ? '' : text).trim();
   return value.length > limit ? `${value.slice(0, limit)}…` : value;
 }
 
-// 把一条教育 / 实习 / 项目条目压成一行。
+// 把知识库原文压成给模型看的「事实清单」。
 //
-// **刻意不按固定槽位取字段** —— 两种简历格式把「学历」「时间」「角色」放在不同字段里:
-//   .txt 的「单位 | 时间 | 备注」把角色放在 position;
-//   .typ 宏格式把角色放在 mid、时间放在 rule(见 resumeParser 的 toItem 与 .txt 分支)。
-// 按槽位取必然漏掉其中一种格式,而漏掉的正好是「实习岗位是什么」这种最该让模型看见的信息。
-// 这里把所有非空字段按固定顺序拼起来,两种格式都能出全。
-function summarizeResumeEntry(entry, charLimit) {
-  const source = entry && typeof entry === 'object' ? entry : {};
-
-  const head = [source.title, source.time, source.rule, source.mid, source.position]
-    .map((value) => String(value == null ? '' : value).trim())
-    .filter(Boolean)
-    .join(' | ');
-
-  const detail = (Array.isArray(source.descs) ? source.descs : [])
-    .map((desc) => {
-      const item = desc && typeof desc === 'object' ? desc : {};
-      return [item.label, item.content]
-        .map((value) => String(value == null ? '' : value).trim())
-        .filter(Boolean)
-        .join(': ');
-    })
-    .filter(Boolean)
-    .join('；');
-
-  return truncateText([head, detail].filter(Boolean).join(' — '), charLimit);
+// 只给**用户自己写进去的东西** —— 这是防编造的根:模型拿不到的事实,它编不出来。
+// 以前这里解析 .txt / .typ 简历、按章节拼事实清单;现在知识库就是一段自由文本,
+// 原样截断给模型,不再猜哪些字段是「实习」哪些是「项目」。
+//
+// 只认字符串:配置被手改成数字时不该把「123」当成候选人资料塞进提示词
+// (normalizeSettings 保证正常路径上是字符串,这里防手改)。
+export function buildKnowledgeFacts(knowledge) {
+  const text = typeof knowledge === 'string' ? truncateText(knowledge, KNOWLEDGE_PROMPT_CHARS) : '';
+  return text ? `【知识库】\n${text}` : '【知识库】\n(空)';
 }
 
-// 把简历压成给模型看的「事实清单」。
-//
-// 只给**简历里明写过的东西** —— 这是防编造的根:模型拿不到的事实,它编不出来。
-//
-// 之前这里只传了姓名、学校和技能标签,于是「海信实习」「国奖竞赛」「开源项目」这些
-// 真正能打的卖点一个都没进提示词 —— 生成出来的招呼语只能泛泛而谈「我很感兴趣」,
-// 用户想要的卖点,模型根本无从知道。
-export function buildResumeFacts(profile) {
-  const sections = (profile && profile.sections) || {};
-  const lines = [`姓名:${truncateText(profile && profile.name, 30) || '未知'}`];
-
-  const render = (list, limit, entryChars) =>
-    (Array.isArray(list) ? list : [])
-      .slice(0, limit)
-      .map((entry) => summarizeResumeEntry(entry, entryChars))
-      .filter(Boolean)
-      .join(' / ');
-
-  const education = render(sections.education, RESUME_PROMPT_LIMITS.education, RESUME_PROMPT_LIMITS.educationChars);
-  if (education) lines.push(`教育:${education}`);
-
-  const experience = render(sections.experience, RESUME_PROMPT_LIMITS.experience, RESUME_PROMPT_LIMITS.experienceChars);
-  if (experience) lines.push(`实习:${experience}`);
-
-  const projects = render(sections.projects, RESUME_PROMPT_LIMITS.projects, RESUME_PROMPT_LIMITS.projectChars);
-  if (projects) lines.push(`项目:${projects}`);
-
-  const skills = (Array.isArray(sections.skills) ? sections.skills : [])
-    .slice(0, RESUME_PROMPT_LIMITS.skills)
-    .map((skill) => String((skill && skill.label) || '').trim())
-    .filter(Boolean);
-  if (skills.length) lines.push(`技能:${skills.join('、')}`);
-
-  return lines.join('\n');
-}
-
-export function buildUserPrompt(job, profile) {
-  const skills = (profile.sections.skills || [])
-    .map((s) => `${s.label}:${s.content}`)
-    .join('\n');
-
+export function buildUserPrompt(job, knowledge) {
   return [
-    '【候选人简历摘要】',
-    `姓名:${profile.name}`,
-    `方向版本:${profile.variant}`,
-    `技能:`,
-    skills,
+    buildKnowledgeFacts(knowledge),
     '',
     '【待判定的岗位】',
     `岗位名:${job.jobName || '(未知)'}`,
@@ -146,7 +78,7 @@ export function buildUserPrompt(job, profile) {
 // 阈值、城市名单、大厂定义这些全在规则里由用户自己写,服务端不再持有任何一份。
 export function buildDecisionPrompt(ruleText) {
   return [
-    '你是求职投递闸门。读候选人的简历摘要和一个招聘岗位,判断这个岗位值不值得投递。',
+    '你是求职投递闸门。读候选人的知识库(本人背景资料)和一个招聘岗位,判断这个岗位值不值得投递。',
     '',
     '【用户设定的投递规则】',
     ruleText,
@@ -346,7 +278,7 @@ async function callOnce(fetchImpl, ai, system, user, timeoutMs, maxTokens) {
 // 返回值里的 `fallback: true` 只表示「拿不到结论」,既不是投也不是不投 —— 调用方据此
 // 跳过该岗位且不进缓存。把 fallback 与 `apply: false` 混为一谈,会让 AI 抖动期间的岗位
 // 被当成「判定不投」记进大屏,分不清「AI 判掉了」和「AI 没判成」。
-export async function decideByPrompt(job, profile, ruleText, options = {}) {
+export async function decideByPrompt(job, knowledge, ruleText, options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   // budgetMs 是**整个函数的总预算**,不是单次超时。
   // 用单次超时 × 重试次数会让最坏耗时翻倍,突破服务端预算和脚本侧超时。
@@ -359,7 +291,7 @@ export async function decideByPrompt(job, profile, ruleText, options = {}) {
     : options.ai;
   const deadline = Date.now() + budgetMs;
   const system = buildDecisionPrompt(ruleText);
-  const user = buildUserPrompt(job, profile);
+  const user = buildUserPrompt(job, knowledge);
 
   let lastError = null;
 
@@ -394,8 +326,7 @@ export async function decideByPrompt(job, profile, ruleText, options = {}) {
 // 而不是被固定句子框住。空串表示没配,退回下面的通用要求。
 //
 // 长度与「不许编造」那两句是载重内容:少了长度它会放飞成客套模板腔,少了禁编造
-// 它会拿简历里根本没有的经历凑句子(示例简历那回就发过「我是示例大学张三,技能方向
-// 是语言和工具」)。
+// 它会拿知识库里根本没有的经历凑句子。
 export function buildGreetingSystemPrompt(options = {}) {
   const rules = [
     '你是求职助手,替候选人写一句发给招聘方的打招呼语。',
@@ -411,11 +342,11 @@ export function buildGreetingSystemPrompt(options = {}) {
 
     '要求:',
     '- 60 字以内;口语自然,不要客套模板腔;只输出招呼语本身,不要引号。',
-    '- 对照 JD 提到的方向,挑简历里**确实做过**的那部分说 —— 可以用 JD 的措辞,但只能说自己做过的。',
+    '- 对照 JD 提到的方向,挑知识库里**确实做过**的那部分说 —— 可以用 JD 的措辞,但只能说自己做过的。',
     // 这条是硬约束,不能松:JD 只用来挑重点,不是用来编造的依据。
-    // 松掉它,JD 里写「熟悉 Kubernetes」而简历里没有时,模型也会替候选人说「熟悉 Kubernetes」。
-    '- **简历是唯一的事实来源**:只准用上面列出的经历、技术和数字,一个字都不许编造简历里没有的经历。',
-    '  JD 里要求、但简历里确实没有的东西,就略过它 —— 宁可不提,也不许替候选人认领。',
+    // 松掉它,JD 里写「熟悉 Kubernetes」而知识库里没有时,模型也会替候选人说「熟悉 Kubernetes」。
+    '- **知识库是唯一的事实来源**:只准用上面知识库里写过的经历、技术和数字,一个字都不许编造知识库里没有的经历。',
+    '  JD 里要求、但知识库里确实没有的东西,就略过它 —— 宁可不提,也不许替候选人认领。',
     '- 结尾落到「感觉和这个岗位很合适 / 很对口」这类表达。',
   ];
 
@@ -435,14 +366,14 @@ export function buildGreetingSystemPrompt(options = {}) {
   return rules.join('\n');
 }
 
-// 招呼语的 user prompt:简历事实 + 岗位 + JD。
-export function buildGreetingPrompt(profile, job, options = {}) {
+// 招呼语的 user prompt:知识库事实 + 岗位 + JD。
+export function buildGreetingPrompt(knowledge, job, options = {}) {
   const jd = String((job && job.postDescription) || '').slice(0, GREETING_JD_CHARS);
 
   return {
     system: buildGreetingSystemPrompt(options),
     user: [
-      buildResumeFacts(profile),
+      buildKnowledgeFacts(knowledge),
       '',
       `岗位:${(job && job.jobName) || ''} @ ${(job && job.company) || ''}`,
       jd ? `JD:${jd}` : 'JD:(接口没返回岗位描述,只能按岗位名判断)',
@@ -451,11 +382,12 @@ export function buildGreetingPrompt(profile, job, options = {}) {
 }
 
 // LLM 不可用时的兜底招呼语。宁可发出去一条普通的,也不要静默漏投。
-export function buildTemplateGreeting(profile, job) {
-  const school = profile.sections.education[0]?.title || '在读';
-  const skill = profile.sections.skills[0]?.label || '';
+//
+// 知识库是一段自由文本,没法再取「学校」「技能」这类结构化字段 —— 所以兜底只点名
+// 岗位,不编造候选人背景。判定已经通过,不该因为一句措辞把岗位丢掉。
+export function buildTemplateGreeting(knowledge, job) {
   const jobName = job.jobName || '该岗位';
-  return `您好,我是${profile.name},来自${school},${skill}方向。看到贵司「${jobName}」岗位比较感兴趣,希望进一步沟通,谢谢。`;
+  return `您好,看到贵司「${jobName}」岗位比较感兴趣,希望进一步沟通,谢谢。`;
 }
 
 // 大屏「测试连通」按钮用的探测请求。它不参与判定,只用来验证端点 / 密钥 / 模型

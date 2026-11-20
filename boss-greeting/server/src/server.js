@@ -1,10 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseAllResumes, VARIANTS } from './resumeParser.js';
-import { selectVariant, buildJdText } from './variantSelector.js';
 import {
   buildTemplateGreeting,
   buildProbePrompt,
@@ -26,10 +23,16 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
+// 运行期数据(配置、知识库、流水)的位置。
+//
+// 默认挨着源码 —— npm start、测试、开发模式都是这个行为,和改造前一致。
+// exe 模式下引导层会设 HELLOBOSS_DATA_DIR 指到 %LOCALAPPDATA%\HelloBoss\data:
+// 单文件分发之后「exe 和 data 一起走」这件事没法再靠目录相邻来保证,数据就跟着用户走。
+// 判定子进程也继承同一个值,两个进程必须看同一份配置。
+const DATA_DIR = process.env.HELLOBOSS_DATA_DIR
+  ? path.resolve(process.env.HELLOBOSS_DATA_DIR)
+  : path.join(ROOT, 'data');
 const PORT = Number(process.env.PORT || 8787);
-// 简历目录。默认是仓库内的 resumes/ —— 里面带了一份示例,所以 clone 下来不配任何
-// 东西也能启动。换成自己的:把简历复制进去(.txt 或 .typ),或用 RESUME_SRC 指到别处。
-const RESUME_SRC = process.env.RESUME_SRC || path.join(ROOT, 'resumes');
 // 超时预算的严格链条:脚本侧等 45 秒 > 服务端最坏 42 秒(判定 30 + 生成 12)。
 // 每层必须小于上一层,否则脚本先断开而服务端还在跑,日志会对不上。
 //
@@ -49,94 +52,14 @@ const GREETING_MAX_TOKENS = 2000;
 const AI_TEST_MAX_TOKENS = 2000;
 const AI_TEST_BUDGET_MS = 15000;
 
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
-
-// 手机端看大屏用的 cookie 名。取这个名字是因为「大屏」在本项目里就是它的唯一用途。
-const COOKIE_NAME = 'big_screen_token';
-const COOKIE_MAX_AGE_SECONDS = 2592000;
-
-// 大屏那条长连接的保活间隔。本机连线基本不会被掐,但手机(手机看大屏)连着时,
-// 空闲连接会被省电策略或中间设备断掉,定期写一帧注释行把它吊住。
+// 大屏那条长连接的保活间隔。本机连线基本不会被掐,但空闲连接会被省电策略或中间设备
+// 断掉,定期写一帧注释行把它吊住。
 const WATCH_HEARTBEAT_MS = 25000;
 
-const SERVER_CONFIG_FILE = path.join(ROOT, 'config', 'server.json');
-
-// 服务自身的运行配置:要不要对局域网开放、以及访问令牌。
+// 跨站写入防护:管的是「谁能在别的站点上替我们发起写入」。
 //
-// 缺文件时返回「只听回环、无鉴权」—— 仓库克隆下来不准备任何东西就能跑,
-// 现有测试与本机日常用法都不受影响。只有显式 lan: true 才会绑全网卡。
-export function loadServerConfig(file) {
-  const target = file || SERVER_CONFIG_FILE;
-  let raw = {};
-
-  if (fs.existsSync(target)) {
-    try {
-      raw = JSON.parse(fs.readFileSync(target, 'utf8'));
-    } catch (error) {
-      throw new Error(`服务配置解析失败:${target}\n原始错误:${error.message}`);
-    }
-  }
-
-  const lan = Boolean(raw) && raw.lan === true;
-  const token = String((raw && raw.token) || '').trim();
-
-  // 开了局域网却没配令牌 = 把岗位记录连同写接口一并交给同网段。宁可起不来。
-  if (lan && !token) {
-    throw new Error(
-      '服务配置开启了局域网访问(lan: true)但没有 token。\n' +
-      `请补上 ${target} 的 token 字段(或把 lan 改成 false 只让本机访问),否则拒绝启动。`,
-    );
-  }
-
-  return { lan, token };
-}
-
-// IPv4 映射写法(::ffff:192.168.1.7)必须先剥壳再比 —— 监听双栈地址时本机请求
-// 就是这种形态,不剥壳会把本机自己的浏览器也判成"外来访问"。
-export function isLoopbackAddress(remoteAddress) {
-  const address = String(remoteAddress || '').trim().toLowerCase();
-  if (!address) return false;
-
-  const bare = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
-  return bare === '::1' || bare === 'localhost' || bare.startsWith('127.');
-}
-
-// 从 Cookie 头里取一个键。值本身可能含 =,所以只按第一个 = 切开。
-function readCookie(header, name) {
-  for (const part of String(header || '').split(';')) {
-    const index = part.indexOf('=');
-    if (index < 0) continue;
-    if (part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
-  }
-  return '';
-}
-
-// 令牌可以走 Authorization 头,也可以走 cookie —— 手机浏览器只能走 cookie:
-// 页面里 fetch('/api/records') 与「导出 CSV」的 <a href> 都带不了自定义请求头。
-//
-// 回环豁免只挡"局域网里别人访问",挡不住"本机自己把外网流量转进来"(隧道/反代)。
-// 真挂了隧道就把 allowLoopback 关掉,那边油猴脚本也要跟着带令牌。
-export function isRequestAuthorized({ remoteAddress, headers, token, allowLoopback }) {
-  if (!token) return true;
-  if (allowLoopback !== false && isLoopbackAddress(remoteAddress)) return true;
-
-  const authorization = String((headers && headers.authorization) || '');
-  if (authorization.startsWith('Bearer ') && authorization.slice('Bearer '.length).trim() === token) {
-    return true;
-  }
-
-  return readCookie(headers && headers.cookie, COOKIE_NAME) === token;
-}
-
-// 跨站写入防护。与令牌鉴权是两件事:令牌管「谁能访问」,这里管「谁能在别的站点上
-// 替我们发起写入」。
-//
-// 起因是 POST /api/settings 把「哪些岗位会被自动投」变成了可远程改的东西,而大屏可能
-// 通过令牌对局域网开放(手机看大屏)—— 拿到令牌的人原本只能看和灌 /report,现在还能
-// 改判定规则,是权限升级。浏览器跨站发起的请求**一定**带 Origin,比对 host 就能挡住
-// 拿着 cookie 的跨站表单提交(令牌 cookie 是 SameSite=Lax,本已挡住大部分,这是第二道)。
+// 起因是 POST /api/settings 把「哪些岗位会被自动投」变成了可远程改的东西。
+// 浏览器跨站发起的请求**一定**带 Origin,比对 host 就能挡住跨站表单提交。
 //
 // 不带 Origin 的一律放行:命令行 curl、油猴脚本的 GM_xmlhttpRequest 都不带,它们也不需要这层。
 export function isCrossOriginWrite(headers) {
@@ -149,6 +72,18 @@ export function isCrossOriginWrite(headers) {
     // Origin 解析不了(如字面量 "null")= 不是正常浏览器请求,按跨站处理。
     return true;
   }
+}
+
+// IPv4 映射写法(::ffff:192.168.1.7)必须先剥壳再比 —— 监听双栈地址时本机请求
+// 就是这种形态,不剥壳会把本机自己的浏览器也判成"外来访问"。
+//
+// 现在只剩 /api/shutdown 在用:那个接口能让整个控制进程退出,只允许本机的引导层调用。
+export function isLoopbackAddress(remoteAddress) {
+  const address = String(remoteAddress || '').trim().toLowerCase();
+  if (!address) return false;
+
+  const bare = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+  return bare === '::1' || bare === 'localhost' || bare.startsWith('127.');
 }
 
 // 缓存身份必须能区分「同一公司在不同城市的同名岗位」。
@@ -183,41 +118,25 @@ function readBody(req) {
 export async function evaluateJob(job, deps) {
   const startedAt = Date.now();
 
-  // 简历版本选择仍然是本地关键词匹配(见 variantSelector.js)—— 它决定招呼语往哪个
-  // 技术方向说,不是投/不投的筛选规则,所以不受「规则全交给 prompt」这次改动影响。
-  const selection = deps.selectVariant(buildJdText(job), deps.profiles, deps.keywords);
-  // 选版失败不能导致整体失败 —— 退回 priority 首位,只是招呼语方向可能不准。
-  const variant = selection.variant || deps.keywords.priority?.[0] || VARIANTS[0];
-  const profile = deps.profileOf(variant);
-
   // 配置由调用方注入而不是自己读文件:否则桩测试会失去隔离。
   // 每次判定都重新 get() 一次,所以大屏上保存后立即生效,不必重启服务。
   const settings = deps.settings ? deps.settings.get() : {};
   const rule = String(settings.decisionPrompt || '').trim();
+  // 知识库就是候选人背景全文,取代了原来的 resumes/ 目录扫描。空着 = 没有事实来源。
+  const knowledge = String(settings.knowledge || '').trim();
 
-  const baseMeta = {
-    variant,
-    variantScore: selection.score,
-    variantEvidence: selection.evidence,
-    greetingFallback: false,
-    cacheHit: false,
-    latencyMs: 0,
-  };
+  const baseMeta = { greetingFallback: false, cacheHit: false, latencyMs: 0 };
 
-  // 没有简历 = 无从判断岗位与候选人是否匹配,同样一个都不放行。
-  //
-  // 这条必须挡在 buildUserPrompt 之前:evaluator 里那句 `profile.sections.skills`
-  // 在 profile 为 undefined 时会抛错,而它在 decideByPrompt 的重试 try/catch **之外**,
-  // 会一路冒到路由变成 500 —— 用户看到的是「服务坏了」,而不是「我还没放简历」。
+  // 没有知识库 = 无从判断岗位与候选人是否匹配,同样一个都不放行。
   //
   // fallback: true 有两个作用:不进缓存(与 AI 不可用同一套规则),以及让调用方
-  // 能把它和「AI 判掉了」区分开 —— 前者是「没判成」,端点/简历补齐后还能重判。
-  if (!profile) {
+  // 能把它和「AI 判掉了」区分开 —— 前者是「没判成」,端点/知识库补齐后还能重判。
+  if (!knowledge) {
     return {
       apply: false,
-      reason: '尚未加载简历,已跳过该岗位 —— 请把简历(.txt / .typ)放进 resumes/ 目录',
+      reason: '尚未填写知识库,已跳过该岗位 —— 请到「① 设置 → 打招呼样式」下面把简历内容粘进去',
       greeting: '',
-      meta: { ...baseMeta, fallback: true, noResume: true, latencyMs: Date.now() - startedAt },
+      meta: { ...baseMeta, fallback: true, noKnowledge: true, latencyMs: Date.now() - startedAt },
     };
   }
 
@@ -235,7 +154,7 @@ export async function evaluateJob(job, deps) {
     };
   }
 
-  const decision = await deps.decideByPrompt(job, profile, rule);
+  const decision = await deps.decideByPrompt(job, knowledge, rule);
 
   // 拿不到结论(判定服务不可用)与「判定不投」必须分开:前者不进缓存,
   // 端点恢复后同一岗位还能重判;混在一起会把一次抖动钉成永久的「不投」。
@@ -267,14 +186,14 @@ export async function evaluateJob(job, deps) {
     // 唯一的硬兜底是 buildTemplateGreeting:生成不可用时至少发一句出去。
     // 判定已经通过,不该因为一句措辞把岗位丢掉。
     try {
-      const generated = await deps.buildGreeting(job, profile);
+      const generated = await deps.buildGreeting(job, knowledge);
       if (generated) greeting = generated;
     } catch {
       // 措辞生成失败不该丢掉一个已判定要投的岗位 —— 落到下面的模板兜底。
     }
 
     if (!greeting) {
-      greeting = buildTemplateGreeting(profile, job);
+      greeting = buildTemplateGreeting(knowledge, job);
       greetingFallback = true;
     }
   }
@@ -292,12 +211,12 @@ export async function evaluateJob(job, deps) {
   };
 }
 
-// 生成招呼语:简历事实(含实习/项目)+ 岗位 + JD,交给模型写一句。
+// 生成招呼语:知识库 + 岗位 + JD,交给模型写一句。
 //
 // stylePrompt 是大屏「打招呼样式」里那段用户要求,只影响怎么写,不逐字发出。
 // 导出是为了能单测:它是「拼提示词 → 调模型」这条链唯一能被一次跑通的地方。
-export async function buildGreetingViaLlm(job, profile, options) {
-  const prompt = buildGreetingPrompt(profile, job, { stylePrompt: options.stylePrompt });
+export async function buildGreetingViaLlm(job, knowledge, options) {
+  const prompt = buildGreetingPrompt(knowledge, job, { stylePrompt: options.stylePrompt });
   const text = await options.callLlm(prompt.system, prompt.user);
   return String(text == null ? '' : text).trim();
 }
@@ -305,23 +224,16 @@ export async function buildGreetingViaLlm(job, profile, options) {
 export function createServer(options = {}) {
   // 运行数据落在服务目录的 data/ 下,不进 git。测试显式传 ledgerFile,
   // 避免把假记录写进真实文件、以及测试之间互相污染。
-  const ledgerFile = options.ledgerFile || path.join(ROOT, 'data', 'jobs.jsonl');
+  const ledgerFile = options.ledgerFile || path.join(DATA_DIR, 'jobs.jsonl');
   // 进程启动时刻即"本轮"的标识 —— 页面据此区分本轮与累计。
   // 只取一次:两次调用会得到不同毫秒值,导致 setRunId 与响应里的 runId 对不上。
   const runId = new Date().toISOString();
   const ledger = createLedger(ledgerFile);
   ledger.setRunId(runId);
 
-  // 默认依赖不读流水(判定与招呼语只依赖配置和简历),注入 deps 的调用方(测试)
+  // 默认依赖只读配置(判定与招呼语只依赖大屏上填的知识库),注入 deps 的调用方(测试)
   // 自带这些依赖,不走这条路。
   const deps = options.deps || buildDefaultDeps();
-
-  // token 可以是函数:大屏上开关「手机看大屏」时令牌是现生成的,而 createServer
-  // 只在启动时建一次。传字符串的老用法(npm start / 测试)保持不变。
-  const tokenSource = options.token;
-  const currentToken = () =>
-    (typeof tokenSource === 'function' ? String(tokenSource() || '') : String(tokenSource || '')).trim();
-  const allowLoopback = options.allowLoopback !== false;
 
   // 判定服务由谁管。exe 起的控制进程会传进来一个控制器(可启动/停止后台判定服务);
   // npm start 与测试不传 = 判定就在本进程里,和以前完全一样。
@@ -330,8 +242,13 @@ export function createServer(options = {}) {
   // 「打开现在的 HelloBoss」,而不是复用可能已经跑了一整夜的旧实例。
   // 只有 exe 的控制进程会传;npm start 与测试不传时这个接口明确回 503。
   const shutdownControl = options.shutdownControl || null;
-  // 局域网开关。只有控制进程会传;命令行启动时这两个接口返回 503。
-  const lanControl = options.lanControl || null;
+
+  // 油猴主脚本的位置。exe 模式下由引导层传进来(那份在解包目录里);
+  // npm start / 开发模式退回仓库里的原文件。
+  //
+  // 默认值刻意指向仓库**上一级** —— 脚本是给浏览器装的,不属于服务,不该被复制进 server/。
+  const userscriptFile = options.userscriptFile
+    || path.resolve(ROOT, '..', 'zhipin-auto-greeting.user.js');
 
   // 谁在看大屏(见 src/idleExit.js)。不传 = 不记账,服务也不会自己退出,
   // 这是 npm start 与绝大多数测试的用法。
@@ -345,35 +262,6 @@ export function createServer(options = {}) {
       // 基址是占位符 —— 只用来把相对 URL 补全成可解析的绝对 URL,不会被请求。
       const parsed = new URL(req.url || '/', 'http://127.0.0.1');
       const pathname = parsed.pathname;
-      // 每个请求现取一次:大屏上刚开启局域网时,新生成的令牌要立刻生效。
-      const token = currentToken();
-
-      // 带令牌访问一次看板 → 换 cookie 再跳到不带令牌的干净地址,免得令牌长期留在
-      // 地址栏与历史记录里。这一步放在鉴权之前:本机(回环免令牌)走同一个地址也会被清干净。
-      const queryToken = parsed.searchParams.get('token');
-      if (req.method === 'GET' && pathname === '/dashboard' && queryToken && token) {
-        if (queryToken !== token) {
-          sendJson(res, 401, { error: '令牌不正确' });
-          return;
-        }
-        res.writeHead(302, {
-          location: '/dashboard',
-          'set-cookie': `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`,
-        });
-        res.end();
-        return;
-      }
-
-      // 鉴权挡在所有路由之前 —— 未授权的 /report 绝不能写进 ledger。
-      if (token && !isRequestAuthorized({
-        remoteAddress: req.socket.remoteAddress,
-        headers: req.headers,
-        token,
-        allowLoopback,
-      })) {
-        sendJson(res, 401, { error: `需要访问令牌:请用 http://<本机IP>:${PORT}/dashboard?token=<令牌> 打开一次` });
-        return;
-      }
 
       if (req.method === 'GET' && pathname === '/health') {
         // aiConfigured 让大屏能提示「还没配密钥,判定会全部跳过」。少了它,用户看到的
@@ -382,7 +270,8 @@ export function createServer(options = {}) {
         const current = deps.settings ? deps.settings.get() : {};
         sendJson(res, 200, {
           ok: true,
-          profiles: deps.profileCount ? deps.profileCount() : deps.profiles.length,
+          // 大屏据此决定要不要挂「没填知识库」的警告条。空知识库 = 一个岗位都不投。
+          hasKnowledge: Boolean(String(current.knowledge || '').trim()),
           cache: cache.size,
           aiConfigured: Boolean(String(current.aiKey || '').trim()),
         });
@@ -437,8 +326,8 @@ export function createServer(options = {}) {
           sendJson(res, 403, { error: '拒绝跨站写入' });
           return;
         }
-        // 只有本机的引导层需要它。手机看大屏时可别让局域网里任何一台拿到令牌的设备
-        // 顺手把整个控制台停掉 —— 那是权限升级。
+        // 只有本机的引导层需要它。它能让整个控制台退出,所以只接受回环地址 ——
+        // 将来若有隧道 / 反代把外部流量转到本机,也不该顺手停掉用户的服务。
         if (!isLoopbackAddress(req.socket.remoteAddress)) {
           await readBody(req);
           sendJson(res, 403, { error: '只允许从本机停止控制进程' });
@@ -456,48 +345,8 @@ export function createServer(options = {}) {
         return;
       }
 
-      // ---- 手机看大屏:开关局域网监听 ----
-      const lanStatus = () => (lanControl
-        ? lanControl.status()
-        : { managed: false, enabled: false, token: '', urls: [] });
-
-      if (req.method === 'GET' && pathname === '/api/lan') {
-        sendJson(res, 200, lanStatus());
-        return;
-      }
-
-      if (req.method === 'POST' && pathname === '/api/lan') {
-        if (isCrossOriginWrite(req.headers)) {
-          sendJson(res, 403, { error: '拒绝跨站写入' });
-          return;
-        }
-        if (!lanControl) {
-          await readBody(req);
-          sendJson(res, 503, { error: '当前是命令行启动,局域网开关不由大屏管理' });
-          return;
-        }
-
-        const raw = await readBody(req);
-        let payload;
-        try {
-          payload = JSON.parse(raw);
-        } catch {
-          sendJson(res, 400, { error: '请求体不是合法 JSON' });
-          return;
-        }
-
-        try {
-          const next = await lanControl.setEnabled(payload && payload.enabled === true);
-          sendJson(res, 200, next);
-        } catch (error) {
-          sendJson(res, 500, { ...lanStatus(), error: error.message });
-        }
-        return;
-      }
-
       // 大屏页面在这里挂一条长连接:这条连接在 = 有人看着,断了 = 页面关了。
-      // 服务据此自己退出(见 src/idleExit.js)。刻意放在鉴权之后 —— EventSource
-      // 不能自定义请求头,但同源请求会带上大屏的令牌 cookie,所以手机侧也走得通。
+      // 服务据此自己退出(见 src/idleExit.js)。
       if (req.method === 'GET' && pathname === '/api/watch') {
         res.writeHead(200, {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -581,6 +430,33 @@ export function createServer(options = {}) {
         return;
       }
 
+      // 从大屏上「一键安装油猴脚本」。
+      //
+      // 为什么由服务发而不是让用户去文件夹里找:篡改猴只对**以 .user.js 结尾的导航**
+      // 弹安装框,而 `file://` 打不开的机器不少(浏览器默认禁止本地文件访问),
+      // 拖进浏览器也不同浏览器行为不一。走 HTTP 就是一次正常的链接点击。
+      //
+      // 路径必须以 `.user.js` 结尾 —— 这是篡改猴认安装请求的唯一依据,改名字就不弹框了。
+      if (req.method === 'GET' && (pathname === '/install.user.js' || pathname === '/zhipin-auto-greeting.user.js')) {
+        let script;
+        try {
+          script = fs.readFileSync(userscriptFile, 'utf8');
+        } catch (error) {
+          // 找不到脚本要说清「是谁在找、去哪找了」,否则用户只看到 404 无从下手。
+          sendJson(res, 404, { error: `找不到油猴脚本(${userscriptFile}):${error.message}` });
+          return;
+        }
+        res.writeHead(200, {
+          // 篡改猴按内容类型判断要不要接管;给 text/plain 它会当成普通文件显示出来。
+          'content-type': 'text/javascript; charset=utf-8',
+          'content-length': Buffer.byteLength(script),
+          // 脚本会被反复读取(用户可能装多次),但内容只跟 exe 版本有关,不设强缓存。
+          'cache-control': 'no-store',
+        });
+        res.end(script);
+        return;
+      }
+
       if (req.method === 'GET' && pathname === '/api/records') {
         // since 缺省或非法时 ledger.readSince 视作 0,即全量返回。
         sendJson(res, 200, {
@@ -607,7 +483,8 @@ export function createServer(options = {}) {
         }
 
         if (req.method === 'GET') {
-          // 脱敏后才出网:明文密钥绝不进响应体 —— 大屏可以带令牌对整个局域网开放。
+          // 脱敏后才出网:明文密钥绝不进响应体。响应体可能被页面或个人抓包留存,
+          // 密钥没有任何理由出现在里面。
           sendJson(res, 200, redactSettings(store.get()));
           return;
         }
@@ -710,7 +587,7 @@ export function createServer(options = {}) {
         const format = detectApiFormat(config.endpoint);
         try {
           await deps.testAi(config);
-          // 响应体里只出结论、格式与模型名。明文密钥绝不进响应体 —— 大屏可以带令牌对局域网开放。
+          // 响应体里只出结论、格式与模型名。明文密钥绝不进响应体。
           sendJson(res, 200, { ok: true, ms: Date.now() - startedAt, model: config.model, format });
         } catch (error) {
           // 探测失败是「问到了上游、上游说不行」(密钥错 / 端点错 / 超时),不是调用本接口的
@@ -766,34 +643,10 @@ export function createServer(options = {}) {
   return server;
 }
 
-// 读不到简历**不阻止启动**。
-//
-// 服务里还有大屏、记录、导 CSV 这些不依赖简历的部分;而「为什么一个岗位都没投」
-// 正确的提示方式是 /health 里的 profiles: 0 加大屏上的警告条,不是让进程起不来 ——
-// 那样用户连去哪儿看提示都不知道。原先是裸抛,别人 clone 下来必崩。
-function loadProfiles(srcDir) {
-  try {
-    const profiles = parseAllResumes(srcDir);
-    if (!profiles.length) {
-      console.warn(`[resume] ${srcDir} 里没有可用的简历(.txt / .typ)—— 判定将全部跳过`);
-    }
-    return profiles;
-  } catch (error) {
-    console.warn(`[resume] 简历目录读取失败(${srcDir}):${error.message} —— 判定将全部跳过`);
-    return [];
-  }
-}
-
 function buildDefaultDeps() {
-  const profiles = loadProfiles(RESUME_SRC);
-  // 只剩选简历版本用的关键词表。判定规则不再有任何结构化配置 ——
-  // 它整段住在大屏的 prompt 里,换一个人用只需要换那段文字。
-  const keywords = readJson(path.join(ROOT, 'config', 'keywords.json'));
-  const byVariant = new Map(profiles.map((p) => [p.variant, p]));
-
-  // 大屏上可改的判定规则与招呼样式。放 data/ 下(已在 .gitignore),
-  // 免得个人的招呼样式被提交进仓库。
-  const settings = createSettingsStore(path.join(ROOT, 'data', 'settings.json'));
+  // 大屏上可改的判定规则、招呼样式、知识库与 AI 接入。放 data/ 下(已在 .gitignore),
+  // 免得个人的知识库与招呼样式被提交进仓库。
+  const settings = createSettingsStore(path.join(DATA_DIR, 'settings.json'));
 
   // 每次调用都现取一次 —— 大屏上保存后立即生效,不必重启服务。
   // 密钥为空时 callChatApi 直接抛错,判定与生成各自走既有的 fallback 分支。
@@ -803,21 +656,14 @@ function buildDefaultDeps() {
   };
 
   return {
-    profiles,
-    keywords,
     settings,
-    // 大屏的简历警告条走这一项:每次现读一遍 resumes/,用户把简历放进去后不必
-    // 重启控制进程就能看到警告消失。判定服务启动时也会自己重新加载。
-    profileCount: () => loadProfiles(RESUME_SRC).length,
-    profileOf: (variant) => byVariant.get(variant) || profiles[0],
-    selectVariant,
-    decideByPrompt: (job, profile, ruleText) =>
-      decideByPrompt(job, profile, ruleText, {
+    decideByPrompt: (job, knowledge, ruleText) =>
+      decideByPrompt(job, knowledge, ruleText, {
         budgetMs: DECISION_BUDGET_MS,
         ai: aiConfig(),
       }),
-    buildGreeting: (job, profile) =>
-      buildGreetingViaLlm(job, profile, {
+    buildGreeting: (job, knowledge) =>
+      buildGreetingViaLlm(job, knowledge, {
         // 用户在大屏「打招呼样式」里写的那段要求。空串 = 没配,走通用要求。
         // 每次现取一次设置,大屏上改完下一个岗位就生效。
         stylePrompt: settings.get().greetingPrompt,
@@ -849,19 +695,6 @@ function buildDefaultDeps() {
   };
 }
 
-// 本机的局域网 IPv4,给手机访问用。只挑 IPv4:家里路由器给的多半是 v4,
-// 而 IPv6 地址又长又会变,写进提示里只会误导。
-export function lanAddresses() {
-  const result = [];
-  for (const infos of Object.values(os.networkInterfaces())) {
-    for (const info of infos || []) {
-      // family 在新版本 Node 里是 'IPv4',老版本是数字 4,两种都认。
-      if ((info.family === 'IPv4' || info.family === 4) && !info.internal) result.push(info.address);
-    }
-  }
-  return result;
-}
-
 /**
  * 启动服务并开始监听,返回 http.Server。
  *
@@ -877,16 +710,9 @@ export function lanAddresses() {
  * @param {boolean} [options.exitWhenIdle] 覆盖「大屏关了自动退出」,不传则看环境变量
  */
 export function startServer(options = {}) {
-  // SERVER_CONFIG 与 RESUME_SRC 同理:让测试能指到别处的配置,不去读、不去碰
-  // 本机真实的 config/server.json —— 否则一旦本机开过局域网访问(lan: true),
-  // 「页面关了自动退出」这条路径的用例就会随本机状态时灵时不灵。
-  const serverConfig = loadServerConfig(process.env.SERVER_CONFIG || undefined);
-
   // 「大屏页面关掉就把服务停掉」只给 npm 开发路径与自动退出测试用。
   // HelloBoss.exe 的控制进程自己管理空闲退出(见 src/supervisor.js),不走这里。
-  // 局域网模式下也不该由某一个标签页决定生死:那时服务是给整个局域网用的。
-  const exitWhenIdle = (options.exitWhenIdle ?? process.env.BOSS_EXIT_WHEN_IDLE === '1')
-    && !serverConfig.lan;
+  const exitWhenIdle = options.exitWhenIdle ?? process.env.BOSS_EXIT_WHEN_IDLE === '1';
 
   // 顺序:记账器要先建出来才能交给 createServer,而它的 onIdle 又要用到 server,
   // 所以 server 先声明后赋值 —— 别改成 const,那样会踩到暂时性死区。
@@ -920,21 +746,14 @@ export function startServer(options = {}) {
     })
     : null;
 
-  server = createServer({ token: serverConfig.token, idle });
-  // lan 用 '::' 而不是 '0.0.0.0' —— 后者只绑 IPv4,手机侧解析到 IPv6 就连不上。
-  const host = serverConfig.lan ? '::' : '127.0.0.1';
+  server = createServer({ idle });
 
-  server.listen(PORT, host, () => {
+  // 只听回环。手机看大屏(局域网监听)已经整套移除 —— 大屏只在本机开。
+  server.listen(PORT, '127.0.0.1', () => {
     console.log(`[HelloBoss] 监听 http://127.0.0.1:${PORT}`);
     console.log(`[HelloBoss] 健康检查 http://127.0.0.1:${PORT}/health`);
     // 页面还没连上之前先给一段宽限,免得「服务刚起来、Edge 还没渲染出大屏」就被判成没人看。
     if (idle) idle.start();
-    if (!serverConfig.lan) return;
-
-    console.log('[HelloBoss] 已对局域网开放(非本机访问需要令牌)');
-    for (const address of lanAddresses()) {
-      console.log(`[HelloBoss] 手机访问 http://${address}:${PORT}/dashboard?token=${serverConfig.token}`);
-    }
   });
 
   return server;

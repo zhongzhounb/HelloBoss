@@ -1,13 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
 import { createSupervisor } from '../src/supervisor.js';
 
-// 控制进程的端到端契约:页面常驻、判定服务默认关闭、按钮启停、局域网配置落盘。
+// 控制进程的端到端契约:页面常驻、判定服务默认关闭、按钮启停。
 // 判定服务用真子进程(和 workerController 测试同理),但内容极简。
 
 const WORKER_CODE = `
@@ -52,13 +49,8 @@ function postJson(url, body) {
 
 test('supervisor: 默认停着,按钮启动后 /evaluate 才转发到后台服务', async (t) => {
   const port = await freePort();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-'));
-  const configFile = path.join(dir, 'server.json');
-  fs.writeFileSync(configFile, JSON.stringify({ lan: false, token: '' }));
-
   const supervisor = createSupervisor({
     port,
-    configFile,
     exitWhenIdle: false,
     spawnWorker: fakeWorker,
     log: () => {},
@@ -98,14 +90,9 @@ test('supervisor: 默认停着,按钮启动后 /evaluate 才转发到后台服�
 
 test('supervisor: /api/shutdown 让旧实例退出,判定服务一起停掉', async (t) => {
   const port = await freePort();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-shutdown-'));
-  const configFile = path.join(dir, 'server.json');
-  fs.writeFileSync(configFile, JSON.stringify({ lan: false, token: '' }));
-
   let exited = false;
   const supervisor = createSupervisor({
     port,
-    configFile,
     exitWhenIdle: false,
     spawnWorker: fakeWorker,
     log: () => {},
@@ -137,44 +124,4 @@ test('supervisor: /api/shutdown 让旧实例退出,判定服务一起停掉', as
   assert.equal(supervisor.worker.isRunning(), false, '退出前要停掉判定服务');
 });
 
-test('supervisor: 开启手机访问会写配置并重新监听', async (t) => {
-  const port = await freePort();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-lan-'));
-  const configFile = path.join(dir, 'server.json');
-  fs.writeFileSync(configFile, JSON.stringify({ lan: false, token: '' }));
 
-  const supervisor = createSupervisor({
-    port,
-    configFile,
-    exitWhenIdle: false,
-    spawnWorker: fakeWorker,
-    log: () => {},
-    exit: () => {},
-  });
-  t.after(() => {
-    if (typeof supervisor.server.closeAllConnections === 'function') {
-      supervisor.server.closeAllConnections();
-    }
-    supervisor.server.close();
-  });
-
-  await supervisor.ready;
-  const base = `http://127.0.0.1:${port}`;
-
-  const lan = await (await postJson(`${base}/api/lan`, { enabled: true })).json();
-  assert.equal(lan.enabled, true);
-  assert.ok(lan.token, '开启局域网时必须生成令牌');
-  assert.equal(lan.urls.length, lan.urls.filter((url) => url.includes(lan.token)).length);
-
-  const saved = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-  assert.equal(saved.lan, true);
-  assert.equal(saved.token, lan.token);
-
-  // 重新绑定是延迟做的(先把响应发出去),等它完成后再确认本机仍能访问。
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  const still = await fetch(`${base}/api/service`);
-  assert.equal(still.status, 200);
-  await still.json();
-
-  supervisor.shutdown();
-});

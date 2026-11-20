@@ -1,9 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,18 +38,11 @@ async function waitForHealthy(port, output) {
 
 test('大屏连接断开后,服务进程自己退出', async (t) => {
   const port = await freePort();
-  // 指到临时配置:本机真实的 config/server.json 一旦是 lan: true,
-  // 这条用例就会随本机状态时灵时不灵(局域网模式下服务本来就不该自己退)。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoexit-'));
-  const configFile = path.join(dir, 'server.json');
-  fs.writeFileSync(configFile, JSON.stringify({ lan: false, token: '' }));
-
   const child = spawn(process.execPath, ['src/server.js'], {
     cwd: SERVER_DIR,
     env: {
       ...process.env,
       PORT: String(port),
-      SERVER_CONFIG: configFile,
       BOSS_EXIT_WHEN_IDLE: '1',
       BOSS_IDLE_GRACE_MS: '300',
     },
