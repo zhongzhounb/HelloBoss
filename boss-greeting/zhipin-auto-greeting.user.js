@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HelloBoss · BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.9
+// @version      0.2.0
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -38,7 +38,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.9',
+    version: '0.2.0',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -50,7 +50,12 @@
     jobDetailApiPattern: /\/wapi\/zpgeek\/job\/detail\.json/i,
     fastReplyUrl: '/wapi/zpchat/fastReply/userFastReplyList/get',
     sheetJsUrl: 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js',
-    defaultGreetingText: '您好，我对这个岗位比较感兴趣，希望可以进一步沟通，谢谢。',
+    // 这里**故意没有**「默认问候语」这种常量。
+    //
+    // 以前有一个 APP.defaultGreetingText,被三处当作兜底:取不到常用语、跨页状态丢了、
+    // 自定义文本为空。它看着像安全网,实际是三条群发通道 —— 那是一句对每个岗位都一样的
+    // 话,连发几百遍正是账号被判群发的头号原因。现在这三处一律停下并说明原因。
+    // 想加回来之前,先想清楚「同一句话发几百遍」这件事。
     storageQuotaWarnRatio: 0.9,
     // 卡片还没被列表接口匹配上时，最多推迟几轮再放弃等待（见 processNextCard 的详情闸门）。
     jobDetailDeferLimit: 3,
@@ -94,11 +99,26 @@
     panelOpen: true,
     featurePanelOpen: false,
     featureBlocks: createDefaultFeatureBlocks(),
-    greetingMode: 'fastReply',
+    // 默认落在「AI 判定」,而不是「常用语」。
+    //
+    // 这不是口味问题:全新安装的用户如果默认落在「常用语」,而他从来没配过常用语
+    // (BOSS 那边一条都没建、或者接口取不到),脚本就会一路退到内置的那句默认问候语,
+    // 一字不变地发给每一个岗位 —— 而「连发几百遍同一句话」正是账号被判群发的头号原因。
+    // 更糟的是 fail-closed 闸门长在 aiGate 分支上,默认走常用语时它根本不生效:
+    // 大屏上规则、密钥、知识库都没配,这边照样往外发。
+    //
+    // 老用户不受影响:normalizeConfig 只在 localStorage 里**没有**这一项时才用默认值,
+    // 存过配置的人保留自己选的那个模式。
+    greetingMode: 'aiGate',
     fastReplyIndex: 0,
     fastReplies: [],
     textSource: 'text',
-    customText: APP.defaultGreetingText,
+    // 刻意留空,不预填一句「默认问候语」。
+    //
+    // 预填的后果和上面那条一样:用户切到「自定义文本」后什么都没写就直接开始,
+    // 发出去的是一模一样的句子。留空配合 validateConfig 的「自定义文本不能为空」,
+    // 会在点「开始」时就拦住他,而不是安静地群发。
+    customText: '',
     // 自定义接口配置：可从外部接口生成问候语，支持参数/请求头/请求体模板。
     customApiUrl: '',
     customApiMethod: 'GET',
@@ -3368,9 +3388,11 @@
       const replies = config.fastReplies || [];
       const selectedIndex = this.getSafeFastReplyIndex(replies);
       const selected = replies[selectedIndex];
+      // 没有常用语时显示一句说明,而不是拿 APP 里那句内置问候语当预览 ——
+      // 那会让人以为「取不到就会发这句」,而实际上现在取不到就停下不发。
       const selectedText = replies.length
         ? normalizeMessageText((selected && selected.text) || `常用语 ${selectedIndex + 1}`)
-        : APP.defaultGreetingText;
+        : '（还没取到常用语）';
 
       if (runtime.ui.fastReplyInput) {
         runtime.ui.fastReplyInput.value = String(selectedIndex);
@@ -3392,7 +3414,7 @@
 
       runtime.ui.fastReplyHint.textContent = replies.length
         ? `已获取 ${replies.length} 条常用语；发送时会把所选文本直接注入聊天框。`
-        : '获取常用语失败或未刷新时，会把默认问候语直接注入聊天框。';
+        : '还没取到常用语。取不到时不会发送任何内容 —— 请点「刷新」重试，或改用「AI 判定」。';
       this.renderFastReplyPickerList();
     },
 
@@ -4200,8 +4222,12 @@
         if (preset) {
           return this.sendText(preset, job, 'aiGateText');
         }
-        // 没有预存文本说明流程异常,退回默认问候语而不是卡死。
-        return this.sendText(APP.defaultGreetingText, job, 'aiGateText');
+        // 没有预存文本 = 流程异常(跨页状态丢了,或服务端回了空招呼语)。
+        //
+        // **不退回那句内置的默认问候语。** 它对每个岗位都一样,发出去就是群发素材;
+        // 而且走到这里说明这一轮的状态已经不可信了,继续发等于拿账号赌。
+        // 抛错会让整轮停下并记进大屏 —— 判了「投」却没发出去,正是「发送异常」要抓的。
+        throw new Error('判定服务没有给出招呼语(跨页状态可能已丢失),已停止发送以免发出与岗位无关的固定话术');
       }
 
       const resolved = config.greetingMode === 'fastReply'
@@ -4214,7 +4240,12 @@
       return this.sendText(resolved.text, job, resolved.messageType);
     },
 
-    // 常用语模式：优先使用已缓存常用语，缺失时刷新接口，最后退回默认问候语。
+    // 常用语模式：优先使用已缓存常用语，缺失时刷新接口。
+    //
+    // **这里没有「最后退回默认问候语」那一步了。** 以前取不到常用语时会退到 APP.defaultGreetingText,
+    // 那是一句对每个岗位都一模一样的话 —— 连发几百遍正是账号被判群发的头号原因,
+    // 而且它绕过了全部筛选(用户在大屏上什么都没配,这边照样往外发)。
+    // 取不到就抛错停下,由调用方记进大屏:宁可漏投,不能把同一句呓语发给所有人。
     async resolveFastReplyText(job) {
       if (config.greetingMode === 'fastReply') {
         const selected = (config.fastReplies || [])[config.fastReplyIndex || 0];
@@ -4231,10 +4262,14 @@
         } catch (_) {}
 
         const refreshed = (config.fastReplies || [])[config.fastReplyIndex || 0] || (config.fastReplies || [])[0];
-        return {
-          messageType: 'fastReplyText',
-          text: interpolateText((refreshed && refreshed.text) || config.customText || APP.defaultGreetingText, job),
-        };
+        if (refreshed && refreshed.text) {
+          return {
+            messageType: 'fastReplyText',
+            text: interpolateText(refreshed.text, job),
+          };
+        }
+
+        throw new Error('常用语模式下没有取到任何常用语,已停止发送 —— 请点面板上的「刷新」,或把问候语来源改成「AI 判定」');
       }
 
       return {
@@ -8495,6 +8530,12 @@
       } catch (error) {
         return `公司黑名单正则无效：${rule.value} / ${error.message}`;
       }
+    }
+
+    if (config.greetingMode === 'fastReply' && !(config.fastReplies || []).some((item) => item && normalizeMessageText(item.text))) {
+      // 在「开始」这一刻就拦住,而不是跑起来之后每个岗位抛一次错。
+      // 取不到常用语时不再退回内置问候语(那等于对所有人发同一句话),所以这里必须拦住。
+      return '常用语模式下还没有取到任何常用语：请点「刷新」重试，或把问候语来源改成「AI 判定」';
     }
 
     if (config.greetingMode === 'customText' && config.textSource === 'text' && !normalizeMessageText(config.customText)) {
